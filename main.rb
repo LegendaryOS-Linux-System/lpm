@@ -1,10 +1,19 @@
-require_relative 'src/ui'
-require_relative 'src/bootc'
-require_relative 'src/commands'
-require_relative 'src/spinner'
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+$LOAD_PATH.unshift File.join(__dir__, 'src')
+
+require 'ui'
+require 'bootc'
+require 'rpm_ostree'
+require 'flatpak'
+require 'distrobox'
+require 'backend'
+require 'commands'
+require 'spinner'
 
 module LPM
-  VERSION = '1.0.0'
+  VERSION = '2.0.0'
   NAME    = 'lpm'
   DISTRO  = 'LegendaryOS'
 end
