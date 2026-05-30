@@ -1,22 +1,17 @@
 require 'io/console'
 
 module Spinner
-  FRAMES = %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏].freeze
+  # Neon pixel-style spinner frames
+  FRAMES = %w[◈ ◇ ◆ ◉ ○ ● ◉ ◆ ◇].freeze
   DONE   = '✔'
   FAIL   = '✖'
 
-  # Runs a block while showing a spinner.
-  # Returns [exit_status, stdout_lines]
-  #
-  # Spinner.run("Fetching image…") { system("bootc upgrade") }
-  def self.run(label, color: UI::C_GOLD, &block)
+  def self.run(label, color: UI::C_MAGENTA, &block)
     done    = false
     success = true
-    result  = nil
     frame_i = 0
 
-    # Hide cursor
-    $stdout.print "\e[?25l"
+    $stdout.print "\e[?25l" # hide cursor
 
     spinner_thread = Thread.new do
       until done
@@ -24,7 +19,7 @@ module Spinner
         lbl   = UI.paint(UI::C_LGREY, label)
         $stdout.print "\r  #{frame}  #{lbl}   "
         $stdout.flush
-        sleep 0.08
+        sleep 0.1
         frame_i += 1
       end
     end
@@ -34,41 +29,45 @@ module Spinner
       success = result != false
     rescue => e
       success = false
-      @last_error = e.message
     ensure
       done = true
       spinner_thread.join
     end
 
-    # Final status line
     if success
       tick = UI.paint(UI::BOLD, UI::C_GREEN, DONE)
-      msg  = UI.paint(UI::C_WHITE, label)
-      $stdout.puts "\r  #{tick}  #{msg}   "
+      $stdout.puts "\r  #{tick}  #{UI.paint(UI::C_WHITE, label)}   "
     else
       cross = UI.paint(UI::BOLD, UI::C_RED, FAIL)
-      msg   = UI.paint(UI::C_WHITE, label)
-      $stdout.puts "\r  #{cross}  #{msg}   "
+      $stdout.puts "\r  #{cross}  #{UI.paint(UI::C_WHITE, label)}   "
     end
 
-    # Restore cursor
-    $stdout.print "\e[?25h"
+    $stdout.print "\e[?25h" # restore cursor
     $stdout.flush
-
-    [success, result]
+    [success, nil]
   end
 
-  # Stream command output with a live prefix indicator
   def self.stream(label, cmd)
     UI.step label
     UI.blank
-
     IO.popen("#{cmd} 2>&1", 'r') do |io|
       io.each_line do |line|
-        $stdout.print "    #{UI.paint(UI::DIM, UI::C_GREY, '│')}  #{UI.paint(UI::C_LGREY, line.chomp)}\n"
+        $stdout.print "    #{UI.paint(UI::DIM, UI::C_VIOLET, '│')}  " \
+                      "#{UI.paint(UI::C_LGREY, line.chomp)}\n"
         $stdout.flush
       end
     end
     $?.success?
+  end
+
+  # Stream a block that yields lines
+  def self.stream_block(label)
+    UI.step label
+    UI.blank
+    yield ->(line) {
+      $stdout.print "    #{UI.paint(UI::DIM, UI::C_VIOLET, '│')}  " \
+    "#{UI.paint(UI::C_LGREY, line.chomp)}\n"
+    $stdout.flush
+    }
   end
 end
