@@ -1,0 +1,2 @@
+# lpm
+LegendaryOS Package Manager.
