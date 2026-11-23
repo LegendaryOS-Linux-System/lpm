@@ -1,0 +1,6 @@
+using <gen 2026>
+;; Uruchamiany przez zenitd przy starcie (legendary-state.service): sprawdza układ i porzuconą transakcję.
+;; STATUS: niezweryfikowany (brak `hl` w środowisku autora) — składnia wg przykładów Hacker Lang 2026.
+~> LegendaryOS: kontrola układu plików
+^> lpm layout-check
+^> lpm status
