@@ -1,0 +1,184 @@
+use "std -> fs" from "fs"
+mod text
+mod sys
+
+;; Czysta logika (bez I/O): mapowanie ścieżek RPM -> układ LegendaryOS oraz
+;; porządek instalacji pakietów (DAG; cykle RPM są przecinane i raportowane).
+
+;; Ścieżka z RPM (względna) -> ścieżka w obrazie. "" = nie trafia do niezmiennego obrazu.
+pub fn map_path(rel: string) -> string is
+    let n: int = rel.len()
+    if n == 0 is return "" end
+    let mut p: string = rel
+    if text::starts_with(p, "./") is p = p[2..n] end
+    if text::starts_with(p, "usr/") is return "system/" + p[4..p.len()] end
+    if p == "usr" is return "system" end
+    if text::starts_with(p, "etc/") is return "system/etc/" + p[4..p.len()] end
+    if p == "etc" is return "system/etc" end
+    let tops: [string] = ["bin", "sbin", "lib", "lib64", "opt"]
+    let mut i: int = 0
+    while i < tops.len() is
+        if p == tops[i] || text::starts_with(p, tops[i] + "/") is return "system/" + p end
+        i += 1
+    end
+    return ""
+end
+
+pub fn is_state_path(rel: string) -> bool is
+    let tops: [string] = ["var", "home", "root", "srv", "run", "tmp", "mnt", "media"]
+    let mut i: int = 0
+    while i < tops.len() is
+        if rel == tops[i] || text::starts_with(rel, tops[i] + "/") is return true end
+        i += 1
+    end
+    return false
+end
+
+pub struct Node is
+    pub name:     string
+    pub requires: [string]
+    pub provides: [string]
+end
+
+pub fn req_name(r: string) -> string is
+    let t: string = text::trim(r)
+    let sp: int = text::find(t, " ")
+    if sp < 0 is return t end
+    return t[0..sp]
+end
+
+fn provides_name(n: Node, want: string) -> bool is
+    if n.name == want is return true end
+    let mut i: int = 0
+    while i < n.provides.len() is
+        if req_name(n.provides[i]) == want is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Indeksy węzłów, od których zależy węzeł `idx` (tylko wewnątrz zbioru).
+pub fn deps_of(nodes: [Node], idx: int) -> [int] is
+    let mut out: [int] = []
+    let me: Node = nodes[idx]
+    let mut r: int = 0
+    while r < me.requires.len() is
+        let want: string = req_name(me.requires[r])
+        r += 1
+        if want != "" && !text::starts_with(want, "rpmlib(") is
+            let mut j: int = 0
+            while j < nodes.len() is
+                if j != idx && provides_name(nodes[j], want) is
+                    let mut seen: bool = false
+                    let mut k: int = 0
+                    while k < out.len() is
+                        if out[k] == j is seen = true end
+                        k += 1
+                    end
+                    if !seen is out.push(j) end
+                end
+                j += 1
+            end
+        end
+    end
+    return out
+end
+
+pub struct Order is
+    pub order:  [int]
+    pub broken: [string]
+end
+
+;; Porządek topologiczny (zależności przed zależnymi); krawędź wsteczna cyklu jest pomijana i raportowana.
+pub fn order(nodes: [Node]) -> Order is
+    let n: int = nodes.len()
+    let mut state: [int] = []
+    let mut i: int = 0
+    while i < n is
+        state.push(0)
+        i += 1
+    end
+    let mut out: [int] = []
+    let mut broken: [string] = []
+    let mut root: int = 0
+    while root < n is
+        if state[root] == 0 is
+            let mut stack: [int] = [root]
+            let mut pos: [int] = [0]
+            state[root] = 1
+            while stack.len() > 0 is
+                let top: int = stack.len() - 1
+                let v: int = stack[top]
+                let ds: [int] = deps_of(nodes, v)
+                if pos[top] < ds.len() is
+                    let w: int = ds[pos[top]]
+                    pos[top] = pos[top] + 1
+                    if state[w] == 0 is
+                        state[w] = 1
+                        stack.push(w)
+                        pos.push(0)
+                    else is
+                        if state[w] == 1 is broken.push(nodes[v].name + " -> " + nodes[w].name) end
+                    end
+                else is
+                    state[v] = 2
+                    out.push(v)
+                    let mut ns: [int] = []
+                    let mut np: [int] = []
+                    let mut k: int = 0
+                    while k < top is
+                        ns.push(stack[k])
+                        np.push(pos[k])
+                        k += 1
+                    end
+                    stack = ns
+                    pos = np
+                end
+            end
+        end
+        root += 1
+    end
+    return Order { order: out, broken: broken }
+end
+
+;; Nazwa pakietu/globa dla dnf: bez spacji i metaznaków powłoki.
+pub fn safe_pkg_name(s: string) -> bool is
+    let n: int = s.len()
+    if n == 0 || n > 120 || text::starts_with(s, "-") is return false end
+    let mut i: int = 0
+    while i < n is
+        let c: string = s[i..i + 1]
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "." || c == "_" || c == "+" || c == "-" || c == "*" || c == ":"
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+;; Przenosi drzewo RPM (usr/, etc/, bin/...) do `out_dir` w układzie LegendaryOS
+;; (system/...). Zwraca pominięte katalogi najwyższego poziomu (var/, home/...).
+pub fn remap_tree(raw_dir: string, out_dir: string) -> [string] is
+    let mut skipped: [string] = []
+    if !fs::is_dir(raw_dir) is return skipped end
+    let tops: [string] = fs::list_dir(raw_dir)
+    let mut i: int = 0
+    while i < tops.len() is
+        let t: string = tops[i]
+        i += 1
+        let dest: string = map_path(t)
+        if dest == "" is
+            skipped.push(t)
+        else is
+            let target: string = text::path_join(out_dir, dest)
+            let src: string = text::path_join(raw_dir, t)
+            if fs::is_dir(src) is
+                sys::mkdir_p(target)
+                let c: bool = sys::ok("cp -a " + sys::sq(src) + "/. " + sys::sq(target) + "/")
+            else is
+                sys::mkdir_p(text::dirname(target))
+                let c2: bool = sys::ok("cp -a " + sys::sq(src) + " " + sys::sq(target))
+            end
+        end
+    end
+    return skipped
+end
