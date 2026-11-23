@@ -1,0 +1,256 @@
+use "std -> fs" from "fs"
+mod text
+mod sys
+mod layout
+mod lmanifest
+mod pkgstore
+mod ui
+mod config
+mod plan
+mod rpmio
+mod journal
+
+;; Magazyn /packages (styl nix, bez restartu): lpm add / del / pkgs / gen / gc.
+;; Każdy RPM trafia do własnej ścieżki store z hashem wejść i listą zależności;
+;; wrappery ustawiają LD_LIBRARY_PATH z closure. To, co ma baza (glibc, Mesa,
+;; sterowniki), zostaje z /system — stąd brak konfliktów z NVIDIA.
+
+fn contains(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+fn pkg_name_of(l: layout::Layout, sname: string) -> string is
+    let m: lmanifest::ParseResult = pkgstore::meta(l, sname)
+    if !m.ok is return "" end
+    return lmanifest::get(m.doc, "package", "name", "")
+end
+
+fn fail(c: config::Config, msg: string) -> int is
+    ui::err(msg)
+    let e: string = layout::lock_mutable(c.l)
+    journal::commit(c.l)
+    return 1
+end
+
+pub fn add(c: config::Config, names: [string]) -> int is
+    let l: layout::Layout = c.l
+    if names.len() == 0 is
+        ui::err("podaj pakiety: lpm add <pakiet>...")
+        return 1
+    end
+    if !c.dry_run && !config::is_root() is
+        ui::err("lpm add wymaga roota (/packages jest tylko do odczytu dla użytkowników)")
+        return 1
+    end
+    let jb: string = journal::begin(l, "add " + text::join(names, " "))
+    if jb != "" is
+        ui::err(jb)
+        return 1
+    end
+    let tmp: string = text::path_join(journal::tmp_root(l), "txn-" + text::istr(sys::pid()))
+    ui::step(1, 3, "rozwiązywanie zależności (względem /system)")
+    let dl: rpmio::DownloadResult = rpmio::download_closure(c, names, text::path_join(tmp, "rpms"))
+    if !dl.ok is
+        ui::err(dl.error)
+        journal::commit(l)
+        return 1
+    end
+    let mut infos: [rpmio::RpmInfo] = []
+    let mut nodes: [plan::Node] = []
+    let mut i: int = 0
+    while i < dl.files.len() is
+        let ins: rpmio::InspectResult = rpmio::inspect(dl.files[i])
+        i += 1
+        if !ins.ok is
+            ui::err(ins.error)
+            journal::commit(l)
+            return 1
+        end
+        infos.push(ins.info)
+        nodes.push(rpmio::node_of(ins.info))
+    end
+    let ord: plan::Order = plan::order(nodes)
+    let mut b: int = 0
+    while b < ord.broken.len() is
+        ui::warn("cykl zależności przecięty: " + ord.broken[b])
+        b += 1
+    end
+    ui::info("pakietów do magazynu: " + text::istr(infos.len()))
+    if c.dry_run is
+        let mut d: int = 0
+        while d < ord.order.len() is
+            ui::info("  + " + rpmio::nevra(infos[ord.order[d]]))
+            d += 1
+        end
+        ui::ok("dry-run: /packages nie został zmieniony")
+        journal::commit(l)
+        return 0
+    end
+    let ue: string = layout::unlock_mutable(l)
+    if ue != "" is return fail(c, ue) end
+    ui::step(2, 3, "instalacja atomowa w /packages/store")
+    let mut store_of: [string] = []     ;; indeks węzła -> nazwa store ("" gdy brak)
+    let mut z: int = 0
+    while z < infos.len() is
+        store_of.push("")
+        z += 1
+    end
+    let bar: bar::ProgressBar = ui::bar(infos.len(), "store")
+    let mut pbar: bar::ProgressBar = bar
+    let mut roots_new: [string] = []
+    let mut o: int = 0
+    while o < ord.order.len() is
+        let idx: int = ord.order[o]
+        o += 1
+        let inf: rpmio::RpmInfo = infos[idx]
+        let raw: string = text::path_join(tmp, "raw-" + text::istr(idx))
+        let mapped: string = text::path_join(tmp, "map-" + text::istr(idx))
+        let e: string = rpmio::extract(inf.path, raw)
+        if e != "" is return fail(c, e) end
+        let sk: [string] = rpmio::remap_tree(raw, mapped)
+        let content: string = text::path_join(mapped, "system")
+        sys::mkdir_p(content)
+        let mut deps: [string] = []
+        let ds: [int] = plan::deps_of(nodes, idx)
+        let mut q: int = 0
+        while q < ds.len() is
+            if store_of[ds[q]] != "" is deps.push(store_of[ds[q]]) end
+            q += 1
+        end
+        let spec: pkgstore::PkgSpec = pkgstore::new_spec(inf.name, inf.version + "-" + inf.release,
+            inf.arch, rpmio::nevra(inf), "fedora:" + c.releasever, inf.sha256, deps)
+        let r: pkgstore::PkgResult = pkgstore::install_dir(l, spec, content)
+        if !r.ok is return fail(c, r.error) end
+        store_of[idx] = r.store_name
+        if contains(names, inf.name) is roots_new.push(r.store_name) end
+        sys::rm_rf(raw)
+        sys::rm_rf(mapped)
+        pbar = pbar.inc(1)
+        pbar.draw()
+    end
+    let fin: bar::ProgressBar = pbar.finish("magazyn gotowy")
+    ui::step(3, 3, "nowa generacja profilu")
+    let mut roots: [string] = pkgstore::current_roots(l)
+    let mut n: int = 0
+    while n < roots_new.len() is
+        if !contains(roots, roots_new[n]) is roots.push(roots_new[n]) end
+        n += 1
+    end
+    if roots_new.len() == 0 is
+        ui::ok("żądane pakiety były już w bazie systemu — nic do dodania")
+        let le0: string = layout::lock_mutable(l)
+        journal::commit(l)
+        return 0
+    end
+    let pr: pkgstore::ProfileResult = pkgstore::profile_build(l, roots, "add " + text::join(names, " "))
+    if !pr.ok is return fail(c, pr.error) end
+    let mut cf: int = 0
+    while cf < pr.conflicts.len() is
+        ui::warn("konflikt plików w profilu: " + pr.conflicts[cf])
+        cf += 1
+    end
+    let le: string = layout::lock_mutable(l)
+    journal::commit(l)
+    ui::ok("profil: generacja " + text::istr(pr.generation) + " (aktywna od razu; /packages/profiles/current/bin w PATH)")
+    return 0
+end
+
+pub fn del(c: config::Config, names: [string]) -> int is
+    let l: layout::Layout = c.l
+    if !c.dry_run && !config::is_root() is
+        ui::err("lpm del wymaga roota")
+        return 1
+    end
+    let roots: [string] = pkgstore::current_roots(l)
+    let mut keep: [string] = []
+    let mut removed: int = 0
+    let mut i: int = 0
+    while i < roots.len() is
+        if contains(names, pkg_name_of(l, roots[i])) is removed += 1 else is keep.push(roots[i]) end
+        i += 1
+    end
+    if removed == 0 is
+        ui::err("żaden z podanych pakietów nie jest w bieżącym profilu")
+        return 1
+    end
+    if c.dry_run is
+        ui::ok("dry-run: usunięto by " + text::istr(removed) + " korzeni profilu")
+        return 0
+    end
+    let jb: string = journal::begin(l, "del " + text::join(names, " "))
+    if jb != "" is
+        ui::err(jb)
+        return 1
+    end
+    let ue: string = layout::unlock_mutable(l)
+    if ue != "" is return fail(c, ue) end
+    let pr: pkgstore::ProfileResult = pkgstore::profile_build(l, keep, "del " + text::join(names, " "))
+    if !pr.ok is return fail(c, pr.error) end
+    let le: string = layout::lock_mutable(l)
+    journal::commit(l)
+    ui::ok("profil: generacja " + text::istr(pr.generation) + " (miejsce zwolni `lpm gc`)")
+    return 0
+end
+
+pub fn list(c: config::Config) -> int is
+    let l: layout::Layout = c.l
+    let roots: [string] = pkgstore::current_roots(l)
+    ui::head("profil /packages — generacja " + text::istr(pkgstore::current_generation(l)))
+    let mut i: int = 0
+    while i < roots.len() is
+        write("  " + roots[i])
+        i += 1
+    end
+    if roots.len() == 0 is ui::info("(pusty)") end
+    return 0
+end
+
+pub fn generations(c: config::Config) -> int is
+    let g: [int] = pkgstore::list_generations(c.l)
+    let cur: int = pkgstore::current_generation(c.l)
+    let mut i: int = 0
+    while i < g.len() is
+        if g[i] == cur is write("  " + text::istr(g[i]) + "  (aktualna)") else is write("  " + text::istr(g[i])) end
+        i += 1
+    end
+    return 0
+end
+
+pub fn rollback_profile(c: config::Config) -> int is
+    if !config::is_root() is
+        ui::err("wymaga roota")
+        return 1
+    end
+    let ue: string = layout::unlock_mutable(c.l)
+    let r: pkgstore::ProfileResult = pkgstore::profile_rollback(c.l)
+    let le: string = layout::lock_mutable(c.l)
+    if !r.ok is
+        ui::err(r.error)
+        return 1
+    end
+    ui::ok("profil: generacja " + text::istr(r.generation))
+    return 0
+end
+
+pub fn gc(c: config::Config) -> int is
+    if !c.dry_run && !config::is_root() is
+        ui::err("lpm gc wymaga roota")
+        return 1
+    end
+    let ue: string = layout::unlock_mutable(c.l)
+    let mut pruned: int = 0
+    if !c.dry_run is pruned = pkgstore::profile_prune(c.l, c.keep_generations) end
+    let r: pkgstore::PkgGcResult = pkgstore::gc(c.l, c.dry_run)
+    let le: string = layout::lock_mutable(c.l)
+    if !r.ok is
+        ui::err(r.error)
+        return 1
+    end
+    ui::ok("generacje usunięte: " + text::istr(pruned) + ", zachowane pakiety: " + text::istr(r.kept) + ", usunięte: " + text::istr(r.removed.len()))
+    return 0
+end
