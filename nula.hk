@@ -1,1 +1,36 @@
+[package]
+-> name        => lpm
+-> version     => 0.1.0
+-> description => LegendaryOS Package Manager — niezmienny menedżer pakietów: warstwy w obrazie (FastTree, styl rpm-ostree) + magazyn /packages (styl nix) + narzędzia /tools (squashfs)
+-> authors     => ["LegendaryOS Team"]
+-> license     => MIT
+-> keywords    => ["lpm", "fasttree", "immutable", "fedora", "zenitd", "legendaryos"]
+-> readme      => README.md
+-> lang        => [h#, z#, hl]
 
+! nula wykrywa biblioteki w kodzie (use "bit -> colors" itd.) — nie trzeba ich tu deklarować.
+! Wyjątek: libfasttree z tego monorepo przypinamy ścieżką (bit nie ma jej jeszcze w indeksie w wersji 0.5).
+[pins]
+-> libfasttree => path ../libfasttree
+
+! UWAGA (patrz docs/Z-SHARP-GAPS.md, pozycja N2): H# 0.9 źle kompiluje pola struktur o typach z aliasu
+! biblioteki, więc moduły libfasttree są dołączane do src/ jako `mod` (scripts/vendor-fasttree.sh).
+[vendor]
+-> libfasttree => src
+
+[layout]
+-> src         => src
+-> mod         => mod
+-> source-code => source-code
+-> build       => build
+
+[commands]
+-> check
+--> run => bit check
+--> description => Sprawdź typy
+-> test
+--> run => h# test src/tests/plan_test.h#
+--> description => Testy czystej logiki (mapowanie ścieżek, kolejność zależności)
+-> vendor
+--> run => scripts/vendor-fasttree.sh
+--> description => Zsynchronizuj moduły libfasttree z ../libfasttree
