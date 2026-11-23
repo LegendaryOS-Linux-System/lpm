@@ -1,0 +1,329 @@
+use "std -> fs" from "fs"
+mod text
+mod sys
+mod layout
+mod deployment
+mod repo
+mod ui
+mod config
+mod plan
+mod rpmio
+mod journal
+
+;; Warstwy pakietów w obrazie systemu (inspirowane rpm-ostree, ale na FastTree):
+;;   lpm install <pkg>   RPM-y (rozwiązane względem działającego systemu) ->
+;;                       drzewo zmian w układzie /system -> NOWY tag (derive) ->
+;;                       obraz composefs -> atomowa podmiana `current` -> restart.
+;;   lpm remove <pkg>    przebudowa od obrazu bazowego z pozostałych warstw
+;;                       (RPM-y z cache) -> nowy tag.
+;; Działający system nie jest modyfikowany.
+
+fn requests_dir(l: layout::Layout) -> string is
+    return text::path_join(layout::lpm_dir(l), "requests")
+end
+
+fn requested_file(l: layout::Layout, tag: string) -> string is
+    return text::path_join(layout::deployments_dir(l), tag + ".requested")
+end
+
+fn rpm_cache(l: layout::Layout) -> string is
+    return text::path_join(layout::lpm_cache(l), "rpms")
+end
+
+pub fn read_requested(l: layout::Layout, tag: string) -> [string] is
+    let p: string = requested_file(l, tag)
+    if !fs::exists(p) is return [] end
+    return text::lines(fs::read(p))
+end
+
+fn write_requested(l: layout::Layout, tag: string, names: [string]) -> bool is
+    return fs::write(requested_file(l, tag), text::join(names, "\n") + "\n")
+end
+
+fn contains(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Tag bazowy: idzie po `parent` aż do wdrożenia kind=base.
+pub fn base_of(l: layout::Layout, tag: string) -> string is
+    let mut t: string = tag
+    let mut guard: int = 0
+    while guard < 1000 is
+        let r: deployment::Record = deployment::load_record(l, t)
+        if r.status == "missing" || r.kind == "base" || r.parent == "" is return t end
+        t = r.parent
+        guard += 1
+    end
+    return t
+end
+
+fn new_tag(l: layout::Layout, cur: string) -> string is
+    let r: deployment::Record = deployment::load_record(l, cur)
+    let g: int = r.generation + 1
+    return "legendaryos-g" + text::istr(g) + "-" + text::istr(sys::now_unix())
+end
+
+;; Buduje obraz composefs i podmienia `current` (fasttree deploy --atomic).
+fn deploy(c: config::Config, tag: string) -> string is
+    let root: string = layout::ft_root(c.l)
+    let r: sys::Exec = sys::exec("FASTTREE_ROOT=" + sys::sq(root) + " fasttree deploy " + sys::sq(tag) + " --atomic")
+    if r.code != 0 is return "fasttree deploy: " + text::trim(r.out) end
+    return ""
+end
+
+fn finish_fail(c: config::Config, msg: string) -> int is
+    ui::err(msg)
+    let u: string = layout::lock_mutable(c.l)
+    journal::commit(c.l)
+    return 1
+end
+
+pub fn install(c: config::Config, pkgs: [string]) -> int is
+    let l: layout::Layout = c.l
+    if pkgs.len() == 0 is
+        ui::err("podaj pakiety: lpm install <pakiet>...")
+        return 1
+    end
+    if !c.dry_run && !config::is_root() is
+        ui::err("lpm install wymaga roota (sudo)")
+        return 1
+    end
+    let cur: string = repo::current_tag(layout::ft_root(l))
+    if cur == "" is
+        ui::err("brak aktywnego wdrożenia FastTree (CURRENT_TAG) w " + layout::ft_root(l))
+        return 1
+    end
+    let jb: string = journal::begin(l, "install " + text::join(pkgs, " "))
+    if jb != "" is
+        ui::err(jb)
+        return 1
+    end
+    let tmp: string = text::path_join(journal::tmp_root(l), "txn-" + text::istr(sys::pid()))
+    let rpms: string = text::path_join(tmp, "rpms")
+    let changes: string = text::path_join(tmp, "changes")
+    sys::mkdir_p(changes)
+    ui::step(1, 4, "rozwiązywanie zależności (" + c.backend + ")")
+    let dl: rpmio::DownloadResult = rpmio::download_closure(c, pkgs, rpms)
+    if !dl.ok is
+        ui::err(dl.error)
+        journal::commit(l)
+        return 1
+    end
+    if dl.files.len() == 0 is
+        ui::ok("nic do zrobienia — wszystko już jest w systemie")
+        journal::commit(l)
+        return 0
+    end
+    let mut infos: [rpmio::RpmInfo] = []
+    let mut layers: [deployment::Layer] = []
+    let mut nevras: [string] = []
+    let mut i: int = 0
+    while i < dl.files.len() is
+        let ins: rpmio::InspectResult = rpmio::inspect(dl.files[i])
+        i += 1
+        if !ins.ok is
+            ui::err(ins.error)
+            journal::commit(l)
+            return 1
+        end
+        infos.push(ins.info)
+        let ne: string = rpmio::nevra(ins.info)
+        nevras.push(ne)
+        layers.push(deployment::new_layer(ins.info.name, ne, "fedora-" + c.releasever))
+    end
+    ui::info("do dołożenia: " + text::istr(infos.len()) + " pakietów")
+    let mut k: int = 0
+    while k < nevras.len() is
+        ui::info("  + " + nevras[k])
+        k += 1
+    end
+    if c.dry_run is
+        ui::ok("dry-run: system nie został zmieniony")
+        journal::commit(l)
+        return 0
+    end
+    ui::step(2, 4, "rozpakowanie i mapowanie /usr -> /system")
+    sys::mkdir_p(rpm_cache(l))
+    let mut j: int = 0
+    while j < infos.len() is
+        let raw: string = text::path_join(tmp, "raw-" + text::istr(j))
+        let e: string = rpmio::extract(infos[j].path, raw)
+        if e != "" is return finish_fail(c, e) end
+        let skipped: [string] = rpmio::remap_tree(raw, changes)
+        if skipped.len() > 0 is ui::warn(infos[j].name + ": pominięto " + text::join(skipped, ", ") + " (obszar /state)") end
+        let cp: bool = sys::ok("cp -f " + sys::sq(infos[j].path) + " " + sys::sq(text::path_join(rpm_cache(l), nevras[j] + ".rpm")))
+        sys::rm_rf(raw)
+        j += 1
+    end
+    ui::step(3, 4, "nowy obraz systemu (FastTree derive)")
+    let ue: string = layout::unlock_mutable(l)
+    if ue != "" is return finish_fail(c, ue) end
+    let tag: string = new_tag(l, cur)
+    let st: deployment::StageResult = deployment::stage_layered(l, cur, changes, tag, layers, config::now_iso())
+    if !st.ok is return finish_fail(c, st.error) end
+    let mut req: [string] = read_requested(l, cur)
+    let mut r: int = 0
+    while r < pkgs.len() is
+        if !contains(req, pkgs[r]) is req.push(pkgs[r]) end
+        r += 1
+    end
+    let w: bool = write_requested(l, tag, req)
+    sys::mkdir_p(requests_dir(l))
+    let mut q: int = 0
+    while q < pkgs.len() is
+        let wl: bool = fs::write(text::path_join(requests_dir(l), pkgs[q] + ".list"), text::join(nevras, "\n") + "\n")
+        q += 1
+    end
+    ui::step(4, 4, "wdrożenie (composefs + atomowa podmiana)")
+    let de: string = deploy(c, tag)
+    if de != "" is
+        let ds: string = deployment::set_status(l, tag, "failed")
+        return finish_fail(c, de)
+    end
+    let md: string = deployment::mark_deployed(l, tag)
+    let le: string = layout::lock_mutable(l)
+    journal::commit(l)
+    ui::ok("wdrożenie " + tag + " gotowe — uruchom ponownie system, aby je aktywować")
+    ui::info("cofnięcie: lpm rollback")
+    return 0
+end
+
+pub fn remove(c: config::Config, pkgs: [string]) -> int is
+    let l: layout::Layout = c.l
+    if !c.dry_run && !config::is_root() is
+        ui::err("lpm remove wymaga roota (sudo)")
+        return 1
+    end
+    let cur: string = repo::current_tag(layout::ft_root(l))
+    if cur == "" is
+        ui::err("brak aktywnego wdrożenia FastTree")
+        return 1
+    end
+    let old: [string] = read_requested(l, cur)
+    let mut keep: [string] = []
+    let mut i: int = 0
+    while i < old.len() is
+        if !contains(pkgs, old[i]) is keep.push(old[i]) end
+        i += 1
+    end
+    let mut j: int = 0
+    while j < pkgs.len() is
+        if !contains(old, pkgs[j]) is
+            ui::err("'" + pkgs[j] + "' nie jest warstwą dołożoną przez lpm (pakiety bazy usuwa się budując nowy obraz)")
+            return 1
+        end
+        j += 1
+    end
+    ;; RPM-y pozostałych żądań z cache
+    let mut nevras: [string] = []
+    let mut k: int = 0
+    while k < keep.len() is
+        let lp: string = text::path_join(requests_dir(l), keep[k] + ".list")
+        if !fs::exists(lp) is
+            ui::err("brak listy RPM dla '" + keep[k] + "' (" + lp + ") — nie można przebudować warstw")
+            return 1
+        end
+        let ls: [string] = text::lines(fs::read(lp))
+        let mut m: int = 0
+        while m < ls.len() is
+            if !contains(nevras, ls[m]) is nevras.push(ls[m]) end
+            m += 1
+        end
+        k += 1
+    end
+    let base: string = base_of(l, cur)
+    ui::info("przebudowa od bazy '" + base + "' z " + text::istr(nevras.len()) + " RPM-ów")
+    if c.dry_run is
+        ui::ok("dry-run: system nie został zmieniony")
+        return 0
+    end
+    let jb: string = journal::begin(l, "remove " + text::join(pkgs, " "))
+    if jb != "" is
+        ui::err(jb)
+        return 1
+    end
+    let tmp: string = text::path_join(journal::tmp_root(l), "txn-" + text::istr(sys::pid()))
+    let changes: string = text::path_join(tmp, "changes")
+    sys::mkdir_p(changes)
+    let mut layers: [deployment::Layer] = []
+    let mut n: int = 0
+    while n < nevras.len() is
+        let f: string = text::path_join(rpm_cache(l), nevras[n] + ".rpm")
+        if !fs::exists(f) is return finish_fail(c, "brak RPM w cache: " + f) end
+        let raw: string = text::path_join(tmp, "raw-" + text::istr(n))
+        let e: string = rpmio::extract(f, raw)
+        if e != "" is return finish_fail(c, e) end
+        let sk: [string] = rpmio::remap_tree(raw, changes)
+        sys::rm_rf(raw)
+        layers.push(deployment::new_layer(nevras[n], nevras[n], "cache"))
+        n += 1
+    end
+    let ue: string = layout::unlock_mutable(l)
+    if ue != "" is return finish_fail(c, ue) end
+    let tag: string = new_tag(l, cur)
+    let st: deployment::StageResult = deployment::stage_layered(l, base, changes, tag, layers, config::now_iso())
+    if !st.ok is return finish_fail(c, st.error) end
+    let w: bool = write_requested(l, tag, keep)
+    let de: string = deploy(c, tag)
+    if de != "" is return finish_fail(c, de) end
+    let md: string = deployment::mark_deployed(l, tag)
+    let le: string = layout::lock_mutable(l)
+    journal::commit(l)
+    ui::ok("wdrożenie " + tag + " gotowe — uruchom ponownie system")
+    return 0
+end
+
+pub fn rollback(c: config::Config) -> int is
+    if !config::is_root() is
+        ui::err("lpm rollback wymaga roota")
+        return 1
+    end
+    let r: repo::RepoResult = repo::rollback(layout::ft_root(c.l))
+    if !r.ok is
+        ui::err(r.error)
+        return 1
+    end
+    ui::ok("przełączono na wdrożenie " + r.value + " (aktywne po restarcie)")
+    return 0
+end
+
+;; Aktualizacja obrazu bazowego: pobranie nowej wersji z rejestru OCI.
+;; Warstwy użytkownika są przebudowywane z cache RPM (ostrzeżenie o ABI).
+pub fn upgrade(c: config::Config) -> int is
+    ui::warn("upgrade: pobiera nowy obraz bazowy; warstwy zostaną przebudowane z cache RPM (patrz docs/ROADMAP.md, M3)")
+    let root: string = layout::ft_root(c.l)
+    if c.dry_run is
+        ui::ok("dry-run: fasttree pull " + c.base_image)
+        return 0
+    end
+    if !config::is_root() is
+        ui::err("lpm upgrade wymaga roota")
+        return 1
+    end
+    let r: sys::Exec = sys::exec("FASTTREE_ROOT=" + sys::sq(root) + " fasttree pull " + sys::sq(c.base_image))
+    if r.code != 0 is
+        ui::err("fasttree pull: " + text::trim(r.out))
+        return 1
+    end
+    ui::ok("pobrano " + c.base_image + " — wdrożenie: lpm deploy <tag> (patrz `fasttree list`)")
+    return 0
+end
+
+pub fn deploy_tag(c: config::Config, tag: string) -> int is
+    if !config::is_root() is
+        ui::err("lpm deploy wymaga roota")
+        return 1
+    end
+    let e: string = deploy(c, tag)
+    if e != "" is
+        ui::err(e)
+        return 1
+    end
+    ui::ok("wdrożono " + tag)
+    return 0
+end
