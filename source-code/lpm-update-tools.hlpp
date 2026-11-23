@@ -1,0 +1,5 @@
+using <gen 2026>
+;; Aktualizuje wszystkie narzędzia z /tools do najnowszych commitów (cron/timer zenitd co tydzień).
+~> LegendaryOS: aktualizacja narzędzi /tools
+^> lpm tools add-all
+^> lpm gc
