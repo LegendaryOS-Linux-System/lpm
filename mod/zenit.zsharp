@@ -1,0 +1,34 @@
+namespace ZenitUnits;
+
+##
+ * ZenitUnits — czysta logika (bez I/O) wokół jednostek zenitd, używana przez lpm przy
+ * instalacji pakietów dostarczających usługi. Moduł Z# w układzie nula (mod/).
+ *
+ * STATUS: NIEZWERYFIKOWANY — w środowisku, w którym powstał, nie było kompilatora Z# (zsc/zsi).
+ * Napisany zgodnie ze składnią modułów nuli (namespace, func $arg, wbudowane strlen/substr/replace/
+ * ends_with/join/split). Pierwsze uruchomienie: `nula check`.
+ *
+ * Cel docelowy (H# <-> Z# przez nula bridge): lpm (H#) woła validName/wantsPath przy
+ * rejestrowaniu jednostek z RPM-ów w /system/lib/zenit/system oraz w /state/etc/zenit/system.
+##
+
+# nula:export
+func validName($name) {
+    # nazwa jednostki: litery, cyfry, - _ . @ ; kończy się .service/.socket/.timer/.target/.path
+    if (strlen($name) < 3 || strlen($name) > 200) { return false; }
+    if (!(ends_with($name, ".service") || ends_with($name, ".socket") || ends_with($name, ".timer")
+          || ends_with($name, ".target") || ends_with($name, ".path"))) { return false; }
+    if (strlen(replace($name, "/", "")) != strlen($name)) { return false; }
+    if (strlen(replace($name, "..", "")) != strlen($name)) { return false; }
+    return true;
+}
+
+# nula:export
+func wantsPath($stateEtc, $target, $unit) {
+    # /state/etc/zenit/system/<target>.wants/<unit> — dowiązanie włączające jednostkę (jak `zenitctl enable`)
+    return $stateEtc . "/zenit/system/" . $target . ".wants/" . $unit;
+}
+
+func unitDir($system) {
+    return $system . "/lib/zenit/system";
+}
