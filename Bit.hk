@@ -1,0 +1,18 @@
+[package]
+-> name        => lpm
+-> version     => 0.1.0
+-> description => LegendaryOS Package Manager — niezmienny menedżer pakietów (FastTree, layering w stylu rpm-ostree, magazyn w stylu nix)
+-> authors     => ["LegendaryOS Team"]
+-> license     => MIT
+-> lang        => h#
+
+[edition]
+-> edition => 2026
+
+[layout]
+-> src => src
+
+[dependencies]
+-> colors => newest
+-> nidus => newest
+-> progress-bar => newest
