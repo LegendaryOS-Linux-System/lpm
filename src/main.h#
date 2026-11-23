@@ -1,1 +1,139 @@
+use "bit -> colors"
+use "bit -> nidus" from "nidus"
+use "bit -> progress-bar" from "pb"
+use "std -> env" from "env"
+mod text
+mod layout
+mod deployment
+mod ui
+mod config
+mod plan
+mod rpmio
+mod journal
+mod layer
+mod pkgs
+mod toolcmd
+mod status
 
+fn usage() -> string is
+    return "lpm — LegendaryOS Package Manager 0.1.0\n\nSystem (warstwy w obrazie, restart):\n  lpm install <pkg>...     dołóż pakiety Fedory do obrazu systemu (nowy deployment)\n  lpm remove  <pkg>...     usuń warstwę (przebudowa od bazy)\n  lpm upgrade              pobierz nowy obraz bazowy (OCI)\n  lpm deploy <tag>         wdróż istniejący tag FastTree\n  lpm rollback             wróć do poprzedniego wdrożenia\n  lpm deployments          lista wdrożeń\n\nPakiety użytkowe (/packages, styl nix, bez restartu):\n  lpm add <pkg>...   lpm del <pkg>...   lpm pkgs   lpm gen   lpm gen-rollback   lpm gc\n\nNarzędzia (/tools, squashfs):\n  lpm tools add <nazwa> [git entry] | add-all | update <n> | list | catalog | mount-all | path <n> | remove <n>\n\nInne: lpm search <fraza> | status | doctor | layout-check | version\nOpcje: --root DIR  --dry-run  -y"
+end
+
+fn main() -> int is
+    let argv: [string] = env::args()
+    let mut args: [string] = []
+    let mut root: string = ""
+    let mut dry: bool = false
+    let mut yes: bool = false
+    let mut i: int = 1
+    while i < argv.len() is
+        let a: string = argv[i]
+        i += 1
+        if a == "--dry-run" is
+            dry = true
+        else is
+            if a == "-y" || a == "--yes" is
+                yes = true
+            else is
+                if a == "--root" && i < argv.len() is
+                    root = argv[i]
+                    i += 1
+                else is
+                    args.push(a)
+                end
+            end
+        end
+    end
+    if args.len() == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" is
+        write(usage())
+        return 0
+    end
+    if args[0] == "version" || args[0] == "--version" is
+        write("lpm 0.1.0 (libfasttree " + "0.5.0" + ")")
+        return 0
+    end
+    let mut l: layout::Layout = layout::default_layout()
+    if root != "" is l = layout::at(root) end
+    let lr: config::LoadResult = config::load(l, dry, yes)
+    if !lr.ok is return 1 end
+    let c: config::Config = lr.cfg
+    let cmd: string = args[0]
+    let mut rest: [string] = []
+    let mut k: int = 1
+    while k < args.len() is
+        rest.push(args[k])
+        k += 1
+    end
+    if cmd == "install" is return layer::install(c, rest) end
+    if cmd == "remove" is return layer::remove(c, rest) end
+    if cmd == "upgrade" is return layer::upgrade(c) end
+    if cmd == "rollback" is return layer::rollback(c) end
+    if cmd == "deploy" is
+        if rest.len() < 1 is
+            ui::err("lpm deploy <tag>")
+            return 1
+        end
+        return layer::deploy_tag(c, rest[0])
+    end
+    if cmd == "deployments" is
+        let rs: [deployment::Record] = deployment::list_records(l)
+        let mut d: int = 0
+        while d < rs.len() is
+            write("  " + rs[d].tag + "  gen=" + text::istr(rs[d].generation) + "  " + rs[d].kind + "  " + rs[d].status)
+            d += 1
+        end
+        return 0
+    end
+    if cmd == "add" is return pkgs::add(c, rest) end
+    if cmd == "del" is return pkgs::del(c, rest) end
+    if cmd == "pkgs" is return pkgs::list(c) end
+    if cmd == "gen" is return pkgs::generations(c) end
+    if cmd == "gen-rollback" is return pkgs::rollback_profile(c) end
+    if cmd == "gc" is return pkgs::gc(c) end
+    if cmd == "search" is
+        if rest.len() < 1 is
+            ui::err("lpm search <fraza>")
+            return 1
+        end
+        write(rpmio::search(c, rest[0]))
+        return 0
+    end
+    if cmd == "status" is return status::status(c) end
+    if cmd == "doctor" is return status::doctor(c) end
+    if cmd == "layout-check" is
+        let p: [string] = layout::validate(l)
+        let mut x: int = 0
+        while x < p.len() is
+            ui::warn(p[x])
+            x += 1
+        end
+        if p.len() == 0 is ui::ok("układ poprawny") end
+        if p.len() > 0 is return 1 end
+        return 0
+    end
+    if cmd == "tools" is
+        if rest.len() < 1 is
+            write(usage())
+            return 1
+        end
+        let sub: string = rest[0]
+        let mut a2: [string] = []
+        let mut y: int = 1
+        while y < rest.len() is
+            a2.push(rest[y])
+            y += 1
+        end
+        if sub == "add" is return toolcmd::add(c, a2) end
+        if sub == "add-all" is return toolcmd::add_all(c) end
+        if sub == "list" is return toolcmd::list(c) end
+        if sub == "catalog" is return toolcmd::catalog(c) end
+        if sub == "mount-all" is return toolcmd::mount_all(c) end
+        if sub == "update" && a2.len() > 0 is return toolcmd::update(c, a2[0]) end
+        if sub == "path" && a2.len() > 0 is return toolcmd::path(c, a2[0]) end
+        if sub == "remove" && a2.len() > 0 is return toolcmd::remove(c, a2[0]) end
+        ui::err("nieznana podkomenda tools: " + sub)
+        return 1
+    end
+    ui::err("nieznana komenda: " + cmd + " (lpm help)")
+    return 1
+end
