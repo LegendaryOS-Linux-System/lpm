@@ -1,0 +1,90 @@
+use "std -> fs" from "fs"
+mod text
+mod sys
+mod layout
+mod hk
+mod ui
+
+;; Konfiguracja lpm: /system/share/legendaryos/lpm.hk (domyślna z obrazu),
+;; nadpisywana przez /state/etc/lpm/lpm.hk.
+;;
+;;   [lpm]
+;;   -> backend          => dnf          ;; dnf (dziś) | satsolv (plan)
+;;   -> releasever       => 43
+;;   -> base-image       => ghcr.io/legendaryos/legendaryos:latest
+;;   -> keep-generations => 3
+;;   -> dnf              => dnf5
+;;   [tools]
+;;   -> catalog          => /system/share/legendaryos/tools.hk
+
+pub struct Config is
+    pub l:                layout::Layout
+    pub backend:          string
+    pub releasever:       string
+    pub base_image:       string
+    pub keep_generations: int
+    pub dnf:              string
+    pub tools_catalog:    string
+    pub dry_run:          bool
+    pub assume_yes:       bool
+end
+
+pub fn defaults(l: layout::Layout) -> Config is
+    return Config { l: l, backend: "dnf", releasever: "43", base_image: "ghcr.io/legendaryos/legendaryos:latest",
+        keep_generations: 3, dnf: "dnf5", tools_catalog: text::path_join(l.system, "share/legendaryos/tools.hk"),
+        dry_run: false, assume_yes: false }
+end
+
+fn apply(c: Config, d: hk::Doc) -> Config is
+    return Config { l: c.l,
+        backend: hk::get(d, "lpm", "backend", c.backend),
+        releasever: hk::get(d, "lpm", "releasever", c.releasever),
+        base_image: hk::get(d, "lpm", "base-image", c.base_image),
+        keep_generations: hk::get_int(d, "lpm", "keep-generations", c.keep_generations),
+        dnf: hk::get(d, "lpm", "dnf", c.dnf),
+        tools_catalog: hk::get(d, "tools", "catalog", c.tools_catalog),
+        dry_run: c.dry_run, assume_yes: c.assume_yes }
+end
+
+pub struct LoadResult is
+    pub ok:  bool
+    pub cfg: Config
+end
+
+pub fn load(l: layout::Layout, dry_run: bool, yes: bool) -> LoadResult is
+    let d0: Config = defaults(l)
+    let mut c: Config = Config { l: d0.l, backend: d0.backend, releasever: d0.releasever, base_image: d0.base_image,
+        keep_generations: d0.keep_generations, dnf: d0.dnf, tools_catalog: d0.tools_catalog,
+        dry_run: dry_run, assume_yes: yes }
+    let paths: [string] = [text::path_join(l.system, "share/legendaryos/lpm.hk"),
+                           text::path_join(layout::state_etc(l), "lpm/lpm.hk")]
+    let mut i: int = 0
+    while i < paths.len() is
+        let p: string = paths[i]
+        i += 1
+        if fs::exists(p) is
+            let src: string = fs::read(p)
+            let r: hk::ParseResult = hk::parse(src)
+            if !r.ok is
+                ui::config_error(p, src, "", r.error, "popraw składnię pliku .hk")
+                return LoadResult { ok: false, cfg: c }
+            end
+            c = apply(c, r.doc)
+        end
+    end
+    if c.backend != "dnf" && c.backend != "satsolv" is
+        ui::err("lpm.hk: nieznany backend '" + c.backend + "' (dnf | satsolv)")
+        return LoadResult { ok: false, cfg: c }
+    end
+    return LoadResult { ok: true, cfg: c }
+end
+
+pub fn now_iso() -> string is
+    let r: sys::Exec = sys::exec("date -u +%Y-%m-%dT%H:%M:%SZ")
+    return text::trim(r.out)
+end
+
+pub fn is_root() -> bool is
+    let r: sys::Exec = sys::exec("id -u")
+    return text::trim(r.out) == "0"
+end
