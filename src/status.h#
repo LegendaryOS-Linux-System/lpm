@@ -1,0 +1,75 @@
+use "std -> fs" from "fs"
+mod text
+mod sys
+mod layout
+mod lmanifest
+mod pkgstore
+mod tools
+mod deployment
+mod repo
+mod ui
+mod config
+mod journal
+
+pub fn status(c: config::Config) -> int is
+    let l: layout::Layout = c.l
+    ui::head("status systemu")
+    let cur: string = repo::current_tag(layout::ft_root(l))
+    let prev: string = repo::previous_tag(layout::ft_root(l))
+    let m: lmanifest::ParseResult = lmanifest::load(l.manifest)
+    if m.ok is
+        ui::kv("system", lmanifest::get(m.doc, "os", "name", "?") + " " + lmanifest::get(m.doc, "os", "version", "?"))
+        ui::kv("baza", lmanifest::get(m.doc, "os", "base", "?") + " " + lmanifest::get(m.doc, "os", "base_release", "?"))
+        ui::kv("init", lmanifest::get(m.doc, "init", "service_manager", "?"))
+        ui::kv("generacja", lmanifest::get(m.doc, "deployment", "generation", "?"))
+        ui::kv("warstwy", text::istr(lmanifest::table_sections(m.doc, "layer").len()))
+    else is
+        ui::warn(m.error)
+    end
+    ui::kv("tag aktywny", cur)
+    ui::kv("tag poprzedni", prev)
+    let pend: string = deployment::pending_tag(l)
+    if pend != "" is ui::kv("oczekujące", pend + "  (aktywne po restarcie)") end
+    ui::kv("profil", "generacja " + text::istr(pkgstore::current_generation(l)) + ", korzeni: " + text::istr(pkgstore::current_roots(l).len()))
+    ui::kv("narzędzia", text::istr(tools::list(l).len()))
+    let st: string = journal::stale(l)
+    if st != "" is ui::warn("przerwana transakcja: " + st + " (zostanie wyczyszczona przy następnej operacji)") end
+    return 0
+end
+
+;; lpm doctor: układ, manifest, narzędzia zewnętrzne.
+pub fn doctor(c: config::Config) -> int is
+    let l: layout::Layout = c.l
+    ui::head("doctor")
+    let mut bad: int = 0
+    let p: [string] = layout::validate(l)
+    let mut i: int = 0
+    while i < p.len() is
+        ui::warn(p[i])
+        bad += 1
+        i += 1
+    end
+    if p.len() == 0 is ui::ok("układ plików poprawny") end
+    let m: lmanifest::ParseResult = lmanifest::load(l.manifest)
+    if m.ok is
+        let mp: [string] = lmanifest::validate_manifest(m.doc)
+        let mut k: int = 0
+        while k < mp.len() is
+            ui::warn("manifest.toml: " + mp[k])
+            bad += 1
+            k += 1
+        end
+        if mp.len() == 0 is ui::ok("manifest.toml poprawny") end
+    end
+    let need: [string] = ["fasttree", "git", "mksquashfs", "curl", "rpm", "rpm2cpio", "cpio", c.dnf, "mkcomposefs", "veritysetup"]
+    let mut t: int = 0
+    while t < need.len() is
+        if sys::have_tool(need[t]) is ui::ok("narzędzie: " + need[t]) else is
+            ui::warn("brak narzędzia: " + need[t])
+            bad += 1
+        end
+        t += 1
+    end
+    if bad > 0 is return 1 end
+    return 0
+end
