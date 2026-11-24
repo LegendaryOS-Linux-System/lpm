@@ -1,0 +1,29 @@
+use "bit -> libfasttree" from "ft"
+use "bit -> lrpm" from "rp"
+use "std -> test" from "test"
+use "std -> fs" from "fs"
+mod plan
+
+;; Test operacji na plikach (remap_tree). UWAGA (N4): import bibliotek bit powoduje, że `h# test` uruchomi też
+;; testy libfasttree/lrpm — uruchamiaj na maszynie z >4 GB RAM. Logika czysta: lrpm/src/tests/lpath_test.h#.
+;; STATUS: niezweryfikowane (brak kompilatora w sesji autora).
+
+#[test]
+fn remap_tree_moves_usr_etc_and_skips_var() is
+    let base: string = ft::text::path_join(ft::sys::tmp_dir(), "lpm-remap-" + ft::text::istr(ft::sys::pid()))
+    ft::sys::rm_rf(base)
+    ft::sys::mkdir_p(base + "/raw/usr/bin")
+    ft::sys::mkdir_p(base + "/raw/etc")
+    ft::sys::mkdir_p(base + "/raw/var/lib/x")
+    ft::sys::mkdir_p(base + "/raw/usr/lib64")
+    let a: bool = fs::write(base + "/raw/usr/bin/htop", "x")
+    let b: bool = fs::write(base + "/raw/etc/htoprc", "y")
+    let c: bool = fs::write(base + "/raw/usr/lib64/libz.so.1", "z")
+    let skipped: [string] = plan::remap_tree(base + "/raw", base + "/out")
+    test::assert_eq(skipped.len(), 1)
+    test::assert_true(fs::exists(base + "/out/system/bin/htop"))
+    test::assert_true(fs::exists(base + "/out/system/etc/htoprc"))
+    test::assert_true(fs::exists(base + "/out/system/lib64/libz.so.1"))
+    test::assert_false(fs::exists(base + "/out/var"))
+    ft::sys::rm_rf(base)
+end
