@@ -1,0 +1,254 @@
+use "std -> fs" from "fs"
+mod ui
+mod config
+mod rpmio
+mod journal
+
+;; Magazyn /packages (styl nix, bez restartu): lpm add / del / pkgs / gen / gc.
+;; Każdy RPM trafia do własnej ścieżki store z hashem wejść i listą zależności; wrappery ustawiają
+;; LD_LIBRARY_PATH z closure. To, co ma baza (glibc, Mesa, sterowniki), zostaje z /system — dlatego
+;; zależności liczy satsolv WZGLĘDEM installed.xml systemu (brak konfliktów z NVIDIA).
+;; Magazyn i profile: ft::api::pkg_* / profile_* (fasada libfasttree, typy proste).
+
+fn contains(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+fn fail(c: config::Config, msg: string) -> int is
+    ui::err(msg)
+    let e: string = ft::api::layout_lock(c.root)
+    journal::commit(c.root)
+    return 1
+end
+
+pub fn add(c: config::Config, names: [string]) -> int is
+    let root: string = c.root
+    if names.len() == 0 is
+        ui::err("podaj pakiety: lpm add <pakiet>...")
+        return 1
+    end
+    if !c.dry_run && !config::is_root() is
+        ui::err("lpm add wymaga roota (/packages jest tylko do odczytu dla użytkowników)")
+        return 1
+    end
+    let jb: string = journal::begin(root, "add " + ft::text::join(names, " "))
+    if jb != "" is
+        ui::err(jb)
+        return 1
+    end
+    let tmp: string = ft::text::path_join(journal::tmp_root(root), "txn-" + ft::text::istr(ft::sys::pid()))
+    ui::step(1, 3, "rozwiązywanie zależności (satsolv, względem /system)")
+    let t: rpmio::Txn = rpmio::prepare(c, names, !c.dry_run)
+    if !t.ok is
+        ui::err(t.error)
+        let mut pi: int = 0
+        while pi < t.problems.len() is
+            ui::warn(t.problems[pi])
+            pi += 1
+        end
+        journal::commit(root)
+        return 1
+    end
+    if t.names.len() == 0 is
+        ui::ok("żądane pakiety były już w bazie systemu — nic do dodania")
+        journal::commit(root)
+        return 0
+    end
+    ui::info("pakietów do magazynu: " + ft::text::istr(t.names.len()))
+    if c.dry_run is
+        let mut d: int = 0
+        while d < t.nevras.len() is
+            ui::info("  + " + t.nevras[d])
+            d += 1
+        end
+        ui::ok("dry-run: /packages nie został zmieniony")
+        journal::commit(root)
+        return 0
+    end
+    ;; metadane zależności (rpm -qp) → graf (porządek topologiczny, cykle przecinane)
+    let mut infos: [rpmio::RpmInfo] = []
+    let mut nodes: [lpath::Node] = []
+    let mut i: int = 0
+    while i < t.files.len() is
+        let ins: rpmio::InspectResult = rpmio::inspect(t.files[i])
+        i += 1
+        if !ins.ok is
+            ui::err(ins.error)
+            journal::commit(root)
+            return 1
+        end
+        infos.push(ins.info)
+        nodes.push(rpmio::node_of(ins.info))
+    end
+    let order: [int] = rp::lpath::order_indices(nodes)
+    let broken: [string] = rp::lpath::order_broken(nodes)
+    let mut b: int = 0
+    while b < broken.len() is
+        ui::warn("cykl zależności przecięty: " + broken[b])
+        b += 1
+    end
+    let ue: string = ft::api::layout_unlock(root)
+    if ue != "" is return fail(c, ue) end
+    ui::step(2, 3, "instalacja atomowa w /packages/store")
+    let mut store_of: [string] = []     ;; indeks węzła -> nazwa store (\"\" gdy brak)
+    let mut z: int = 0
+    while z < infos.len() is
+        store_of.push("")
+        z += 1
+    end
+    let mut pbar: bar::ProgressBar = ui::bar(infos.len(), "store")
+    let mut roots_new: [string] = []
+    let mut o: int = 0
+    while o < order.len() is
+        let idx: int = order[o]
+        o += 1
+        let inf: rpmio::RpmInfo = infos[idx]
+        let raw: string = ft::text::path_join(tmp, "raw-" + ft::text::istr(idx))
+        let mapped: string = ft::text::path_join(tmp, "map-" + ft::text::istr(idx))
+        let e: string = rpmio::extract(inf.path, raw)
+        if e != "" is return fail(c, e) end
+        let sk: [string] = rpmio::remap_tree(raw, mapped)
+        let content: string = ft::text::path_join(mapped, "system")
+        ft::sys::mkdir_p(content)
+        let mut deps: [string] = []
+        let ds: [int] = rp::lpath::deps_of(nodes, idx)
+        let mut q: int = 0
+        while q < ds.len() is
+            if store_of[ds[q]] != "" is deps.push(store_of[ds[q]]) end
+            q += 1
+        end
+        let r: [string] = ft::api::pkg_install(root, inf.name, inf.version + "-" + inf.release, inf.arch,
+            rpmio::nevra(inf), "fedora:" + c.releasever, inf.sha256, deps, content)
+        if r[0] != "" is return fail(c, r[0]) end
+        store_of[idx] = r[1]
+        if contains(names, inf.name) is roots_new.push(r[1]) end
+        ft::sys::rm_rf(raw)
+        ft::sys::rm_rf(mapped)
+        pbar = pbar.inc(1)
+        pbar.draw()
+    end
+    let fin: bar::ProgressBar = pbar.finish("magazyn gotowy")
+    ui::step(3, 3, "nowa generacja profilu")
+    let mut roots: [string] = ft::api::profile_roots(root)
+    let mut n: int = 0
+    while n < roots_new.len() is
+        if !contains(roots, roots_new[n]) is roots.push(roots_new[n]) end
+        n += 1
+    end
+    if roots_new.len() == 0 is
+        ui::ok("żądane pakiety były już w bazie systemu — nic do dodania")
+        let le0: string = ft::api::layout_lock(root)
+        journal::commit(root)
+        return 0
+    end
+    let pr: [string] = ft::api::profile_build(root, roots, "add " + ft::text::join(names, " "))
+    if pr[0] != "" is return fail(c, pr[0]) end
+    let mut cf: int = 2
+    while cf < pr.len() is
+        ui::warn("konflikt plików w profilu: " + pr[cf])
+        cf += 1
+    end
+    let le: string = ft::api::layout_lock(root)
+    journal::commit(root)
+    ui::ok("profil: generacja " + pr[1] + " (aktywna od razu; /packages/profiles/current/bin w PATH)")
+    return 0
+end
+
+pub fn del(c: config::Config, names: [string]) -> int is
+    let root: string = c.root
+    if !c.dry_run && !config::is_root() is
+        ui::err("lpm del wymaga roota")
+        return 1
+    end
+    let roots: [string] = ft::api::profile_roots(root)
+    let mut keep: [string] = []
+    let mut removed: int = 0
+    let mut i: int = 0
+    while i < roots.len() is
+        if contains(names, ft::api::pkg_name_of(root, roots[i])) is removed += 1 else is keep.push(roots[i]) end
+        i += 1
+    end
+    if removed == 0 is
+        ui::err("żaden z podanych pakietów nie jest w bieżącym profilu")
+        return 1
+    end
+    if c.dry_run is
+        ui::ok("dry-run: usunięto by " + ft::text::istr(removed) + " korzeni profilu")
+        return 0
+    end
+    let jb: string = journal::begin(root, "del " + ft::text::join(names, " "))
+    if jb != "" is
+        ui::err(jb)
+        return 1
+    end
+    let ue: string = ft::api::layout_unlock(root)
+    if ue != "" is return fail(c, ue) end
+    let pr: [string] = ft::api::profile_build(root, keep, "del " + ft::text::join(names, " "))
+    if pr[0] != "" is return fail(c, pr[0]) end
+    let le: string = ft::api::layout_lock(root)
+    journal::commit(root)
+    ui::ok("profil: generacja " + pr[1] + " (miejsce zwolni `lpm gc`)")
+    return 0
+end
+
+pub fn list(c: config::Config) -> int is
+    let roots: [string] = ft::api::profile_roots(c.root)
+    ui::head("profil /packages — generacja " + ft::text::istr(ft::api::profile_generation(c.root)))
+    let mut i: int = 0
+    while i < roots.len() is
+        write("  " + roots[i])
+        i += 1
+    end
+    if roots.len() == 0 is ui::info("(pusty)") end
+    return 0
+end
+
+pub fn generations(c: config::Config) -> int is
+    let g: [int] = ft::api::profile_generations(c.root)
+    let cur: int = ft::api::profile_generation(c.root)
+    let mut i: int = 0
+    while i < g.len() is
+        if g[i] == cur is write("  " + ft::text::istr(g[i]) + "  (aktualna)") else is write("  " + ft::text::istr(g[i])) end
+        i += 1
+    end
+    return 0
+end
+
+pub fn rollback_profile(c: config::Config) -> int is
+    if !config::is_root() is
+        ui::err("wymaga roota")
+        return 1
+    end
+    let ue: string = ft::api::layout_unlock(c.root)
+    let r: [string] = ft::api::profile_rollback(c.root)
+    let le: string = ft::api::layout_lock(c.root)
+    if r[0] != "" is
+        ui::err(r[0])
+        return 1
+    end
+    ui::ok("profil: generacja " + r[1])
+    return 0
+end
+
+pub fn gc(c: config::Config) -> int is
+    if !c.dry_run && !config::is_root() is
+        ui::err("lpm gc wymaga roota")
+        return 1
+    end
+    let ue: string = ft::api::layout_unlock(c.root)
+    let mut pruned: int = 0
+    if !c.dry_run is pruned = ft::api::profile_prune(c.root, c.keep_generations) end
+    let r: [string] = ft::api::pkg_gc(c.root, c.dry_run)
+    let le: string = ft::api::layout_lock(c.root)
+    if r[0] != "" is
+        ui::err(r[0])
+        return 1
+    end
+    ui::ok("generacje usunięte: " + ft::text::istr(pruned) + ", zachowane pakiety: " + r[1] + ", usunięte: " + r[2])
+    return 0
+end
