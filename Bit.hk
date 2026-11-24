@@ -3,7 +3,7 @@
 -> version     => 0.2.0
 -> description => LegendaryOS Package Manager — niezmienny menedżer pakietów (FastTree, layering w stylu rpm-ostree, magazyn w stylu nix)
 -> authors     => ["LegendaryOS Team"]
--> license     => MIT
+-> license     => MPL-2.0
 -> lang        => h#
 
 [edition]
