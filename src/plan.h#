@@ -1,0 +1,32 @@
+use "std -> fs" from "fs"
+
+;; Operacje na drzewie plików dla lpm (I/O). Czysta logika (map_path, porządek zależności, walidacja nazw)
+;; jest w bibliotece lrpm: `rp::lpath::*` i `rp::pure::safe_name` (testowalna bez bibliotek bit).
+
+;; Przenosi drzewo RPM (usr/, etc/, bin/...) do `out_dir` w układzie LegendaryOS
+;; (system/...). Zwraca pominięte katalogi najwyższego poziomu (var/, home/...).
+pub fn remap_tree(raw_dir: string, out_dir: string) -> [string] is
+    let mut skipped: [string] = []
+    if !fs::is_dir(raw_dir) is return skipped end
+    let tops: [string] = fs::list_dir(raw_dir)
+    let mut i: int = 0
+    while i < tops.len() is
+        let t: string = tops[i]
+        i += 1
+        let dest: string = rp::lpath::map_path(t)
+        if dest == "" is
+            skipped.push(t)
+        else is
+            let target: string = ft::text::path_join(out_dir, dest)
+            let src: string = ft::text::path_join(raw_dir, t)
+            if fs::is_dir(src) is
+                ft::sys::mkdir_p(target)
+                let c: bool = ft::sys::ok("cp -a " + ft::sys::sq(src) + "/. " + ft::sys::sq(target) + "/")
+            else is
+                ft::sys::mkdir_p(ft::text::dirname(target))
+                let c2: bool = ft::sys::ok("cp -a " + ft::sys::sq(src) + " " + ft::sys::sq(target))
+            end
+        end
+    end
+    return skipped
+end
