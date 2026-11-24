@@ -1,0 +1,178 @@
+use "std -> fs" from "fs"
+mod ui
+mod config
+
+;; /tools: narzędzia HackerOS i Zenit Linux (git -> squashfs, montowane ro).
+;; Całość przez fasadę libfasttree (ft::api::tool_*, ft::api::hk_*) — typy proste, brak struktur z biblioteki.
+;; Katalog narzędzi (tools.hk, dostarczany w obrazie):
+;;   [tools]
+;;   -> hacker
+;;   --> git   => https://github.com/HackerOS-Linux-System/hacker
+;;   --> entry => bin/hacker
+;;   --> build => ""                ;; opcjonalne polecenie budowy
+
+pub fn catalog_names(path: string) -> [string] is
+    let mut out: [string] = []
+    let ks: [string] = ft::api::hk_keys(path, "tools")
+    let mut i: int = 0
+    while i < ks.len() is
+        if ft::text::ends_with(ks[i], ".git") is out.push(ks[i][0..ks[i].len() - 4]) end
+        i += 1
+    end
+    return out
+end
+
+fn need_root(c: config::Config) -> bool is
+    if c.dry_run || config::is_root() is return true end
+    ui::err("ta operacja wymaga roota (/tools jest tylko do odczytu)")
+    return false
+end
+
+fn catalog_err(c: config::Config) -> string is return ft::api::hk_check(c.tools_catalog) end
+
+;; Pakuje narzędzie (git → squashfs). `build` może być "".
+pub fn pack_one(c: config::Config, name: string, git: string, rev: string, entry: string, build: string) -> int is
+    if git == "" is
+        ui::err("narzędzie '" + name + "' nie ma adresu git w katalogu")
+        return 1
+    end
+    ui::info("klonowanie i pakowanie " + name + " (" + git + ")")
+    if c.dry_run is
+        ui::ok("dry-run: " + name)
+        return 0
+    end
+    let ue: string = ft::api::layout_unlock(c.root)
+    if ue != "" is
+        ui::err(ue)
+        return 1
+    end
+    let r: [string] = ft::api::tool_pack(c.root, name, git, rev, entry, build)
+    let le: string = ft::api::layout_lock(c.root)
+    if r[0] != "" is
+        ui::err(r[0])
+        return 1
+    end
+    ui::ok(name + " @ " + r[1][0..12] + "  " + ft::text::istr(ft::text::parse_int(r[2], 0) / 1024) + " KiB (squashfs zstd)")
+    return 0
+end
+
+fn pack_from_catalog(c: config::Config, name: string) -> int is
+    let p: string = c.tools_catalog
+    return pack_one(c, name, ft::api::hk_get(p, "tools", name + ".git", ""), ft::api::hk_get(p, "tools", name + ".rev", ""),
+        ft::api::hk_get(p, "tools", name + ".entry", ""), ft::api::hk_get(p, "tools", name + ".build", ""))
+end
+
+;; lpm tools add <nazwa> [git entry]  — z katalogu albo jawnie
+pub fn add(c: config::Config, args: [string]) -> int is
+    if args.len() == 0 is
+        ui::err("lpm tools add <nazwa> [<git> <entry>]")
+        return 1
+    end
+    if !need_root(c) is return 1 end
+    if args.len() >= 3 is return pack_one(c, args[0], args[1], "", args[2], "") end
+    let ce: string = catalog_err(c)
+    if ce != "" is
+        ui::err("katalog narzędzi: " + ce)
+        return 1
+    end
+    return pack_from_catalog(c, args[0])
+end
+
+pub fn add_all(c: config::Config) -> int is
+    if !need_root(c) is return 1 end
+    let ce: string = catalog_err(c)
+    if ce != "" is
+        ui::err("katalog narzędzi: " + ce)
+        return 1
+    end
+    let names: [string] = catalog_names(c.tools_catalog)
+    let mut fails: int = 0
+    let mut i: int = 0
+    while i < names.len() is
+        if pack_from_catalog(c, names[i]) != 0 is fails += 1 end
+        i += 1
+    end
+    return fails
+end
+
+pub fn update(c: config::Config, name: string) -> int is
+    if !need_root(c) is return 1 end
+    let git: string = ft::api::tool_meta(c.root, name, "git")
+    if git == "" is
+        ui::err("narzędzie '" + name + "' nie jest zainstalowane")
+        return 1
+    end
+    return pack_one(c, name, git, ft::api::tool_meta(c.root, name, "rev"), ft::api::tool_meta(c.root, name, "entry"), "")
+end
+
+pub fn list(c: config::Config) -> int is
+    let t: [string] = ft::api::tool_list(c.root)
+    let mut i: int = 0
+    while i < t.len() is
+        let mut mark: string = "odmontowane"
+        if ft::api::tool_is_mounted(c.root, t[i]) is mark = "zamontowane" end
+        write("  " + t[i] + "  " + ft::api::tool_meta(c.root, t[i], "commit")[0..12] + "  " + mark)
+        i += 1
+    end
+    if t.len() == 0 is ui::info("brak zainstalowanych narzędzi (lpm tools add-all)") end
+    return 0
+end
+
+pub fn catalog(c: config::Config) -> int is
+    let ce: string = catalog_err(c)
+    if ce != "" is
+        ui::err("katalog narzędzi (" + c.tools_catalog + "): " + ce)
+        return 1
+    end
+    let names: [string] = catalog_names(c.tools_catalog)
+    let mut i: int = 0
+    while i < names.len() is
+        write("  " + names[i] + "  " + ft::api::hk_get(c.tools_catalog, "tools", names[i] + ".git", ""))
+        i += 1
+    end
+    return 0
+end
+
+pub fn mount_all(c: config::Config) -> int is
+    let t: [string] = ft::api::tool_list(c.root)
+    let mut fails: int = 0
+    let mut i: int = 0
+    while i < t.len() is
+        let e: string = ft::api::tool_mount(c.root, t[i])
+        if e != "" is
+            ui::err(t[i] + ": " + e)
+            fails += 1
+        end
+        i += 1
+    end
+    return fails
+end
+
+;; Zamontuj (jeśli trzeba) i wypisz ścieżkę pliku wykonywalnego — używa jej `legendary-tool`.
+pub fn path(c: config::Config, name: string) -> int is
+    let e: string = ft::api::tool_mount(c.root, name)
+    if e != "" is
+        ui::err(e)
+        return 1
+    end
+    let p: string = ft::api::tool_entry_path(c.root, name)
+    if p == "" is
+        ui::err("narzędzie '" + name + "' nie ma zdefiniowanego entry")
+        return 1
+    end
+    write(p)
+    return 0
+end
+
+pub fn remove(c: config::Config, name: string) -> int is
+    if !need_root(c) is return 1 end
+    let ue: string = ft::api::layout_unlock(c.root)
+    let e: string = ft::api::tool_remove(c.root, name)
+    let le: string = ft::api::layout_lock(c.root)
+    if e != "" is
+        ui::err(e)
+        return 1
+    end
+    ui::ok("usunięto " + name)
+    return 0
+end
