@@ -1,0 +1,51 @@
+use "std -> fs" from "fs"
+
+;; Dziennik transakcji lpm: /state/lpm/journal/current. Jedna transakcja naraz;
+;; po awarii (zabity proces) lpm wykrywa przeterminowany wpis i czyści katalog tmp.
+;; Same zmiany systemu są atomowe (nowy tag + podmiana symlinku), więc awaria
+;; nie zostawia półzmienionego systemu — najwyżej śmieci w /state/lpm/tmp.
+;; Funkcje biorą `root` (string) — nie typy libfasttree (zob. libfasttree/docs/USING-AS-LIBRARY.md).
+
+fn cur_path(root: string) -> string is
+    return ft::text::path_join(ft::api::lpm_journal_dir(root), "current")
+end
+
+pub fn tmp_root(root: string) -> string is
+    return ft::text::path_join(ft::api::path_lpm_dir(root), "tmp")
+end
+
+fn pid_alive(pid: int) -> bool is
+    if pid <= 0 is return false end
+    return ft::sys::ok("kill -0 " + ft::text::istr(pid) + " 2>/dev/null")
+end
+
+;; "" gdy OK; inaczej komunikat (inna transakcja trwa).
+pub fn begin(root: string, op: string) -> string is
+    ft::sys::mkdir_p(ft::api::lpm_journal_dir(root))
+    let p: string = cur_path(root)
+    if fs::exists(p) is
+        let parts: [string] = ft::text::split(ft::text::trim(fs::read(p)), " ")
+        let pid: int = ft::text::parse_int(parts[0], 0)
+        if pid_alive(pid) is
+            return "inna transakcja lpm trwa (pid " + ft::text::istr(pid) + ": " + ft::text::join(parts, " ") + ")"
+        end
+        ft::sys::rm_rf(tmp_root(root))
+    end
+    if !fs::write(p, ft::text::istr(ft::sys::pid()) + " " + op) is return "nie można zapisać dziennika " + p end
+    return ""
+end
+
+pub fn commit(root: string) is
+    ft::sys::rm_f(cur_path(root))
+    ft::sys::rm_rf(tmp_root(root))
+end
+
+;; Opis przeterminowanej transakcji albo "".
+pub fn stale(root: string) -> string is
+    let p: string = cur_path(root)
+    if !fs::exists(p) is return "" end
+    let t: string = ft::text::trim(fs::read(p))
+    let pid: int = ft::text::parse_int(ft::text::split(t, " ")[0], 0)
+    if pid_alive(pid) is return "" end
+    return t
+end
