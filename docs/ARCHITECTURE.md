@@ -1,33 +1,29 @@
-# lpm — architektura
+# lpm — architektura (0.2)
 
-## Moduły (`src/`)
 | plik | rola |
 |---|---|
-| `main.h#` | CLI, flagi `--root/--dry-run/-y` |
-| `config.h#` | `lpm.hk` (obraz → `/state/etc/lpm/lpm.hk`), błędy przez nidus |
-| `layer.h#` | `install/remove/upgrade/rollback/deploy` — warstwy w obrazie |
-| `pkgs.h#` | `add/del/pkgs/gen/gc` — magazyn `/packages` |
-| `toolcmd.h#` | `/tools`: katalog `tools.hk`, pack/mount/update |
-| `rpmio.h#` | `dnf download --resolve`, `rpm -qp`, `rpm2cpio | cpio`, remap ścieżek |
-| `plan.h#` | **czysta logika**: `map_path`, porządek topologiczny z cyklami, walidacja nazw (testy) |
-| `journal.h#` | dziennik transakcji (jedna naraz, sprzątanie po awarii) |
+| `main.h#` | wejście: **importy bit** (`libfasttree` jako `ft`, `lrpm` jako `rp`, colors, nidus, progress-bar), parsowanie opcji, dyspozytor komend, `triggers` |
+| `config.h#` | `lpm.hk` (obraz + `/state/etc/lpm/lpm.hk`) → `Config` (**tylko typy proste**; `root: string` zamiast `Layout`) |
+| `rpmio.h#` | adapter na **lrpm**: `prepare` (sync → solver → pobranie), `extract`, `sync`, `search`; `inspect` (`rpm -qp`) dla `lpm add` |
+| `layer.h#` | `install`/`remove`/`rollback`/`upgrade`/`deploy` — warstwy w obrazie; FastTree przez `ft::api::*` |
+| `pkgs.h#` | `add`/`del`/`pkgs`/`gen`/`gc` — magazyn `/packages` przez `ft::api::pkg_*`/`profile_*` |
+| `toolcmd.h#` | `/tools` przez `ft::api::tool_*` i `ft::api::hk_*` |
 | `status.h#` | `status`, `doctor` |
-| `ui.h#` | colors / progress-bar / nidus |
-| reszta | zsynchronizowane moduły libfasttree (`scripts/vendor-fasttree.sh`) |
+| `plan.h#` | tylko `remap_tree` (I/O); czysta logika → `lrpm::lpath` |
+| `journal.h#` | dziennik transakcji (`/state/lpm/journal`) |
+| `ui.h#` | wygląd: colors/progress-bar/nidus |
 
 ## Przepływ `lpm install`
-1. `dnf5 download --resolve` względem **działającego** `/system` — pobiera tylko to, czego baza nie ma (glibc, Mesa, NVIDIA zostają z obrazu).
-2. `rpm -qp` → metadane; `rpm2cpio | cpio` → drzewo; `plan::map_path`: `usr/→system/`, `etc/→system/etc/`, `bin|sbin|lib|lib64|opt→system/…`; `var/ home/ run/…` pomijane (obszar `/state`).
-3. `deployment::stage_layered`: nowy `manifest.toml` (generacja+1, parent, `[[layer]]`) + `derive` ⇒ nowy tag FastTree.
-4. `fasttree deploy <tag> --atomic`: obraz composefs + podmiana `current` (rename). Restart ⇒ nowy system. `lpm rollback` ⇒ poprzedni.
-Skrypty `%post` RPM **nie** są uruchamiane (obraz niezmienny) — patrz ROADMAP, kamień M3.
+1. `rpmio::prepare` → `rp::txn::flat_prepare`: metadane (cache) → **satsolv** względem `installed.xml` + atrapy z `compat.hk` → pobranie i weryfikacja RPM (sha256, GPG).
+2. Rozpakowanie każdego RPM (`bsdtar`) → `remap_tree` (/usr→/system, /etc→/system/etc; /var,/home→pomijane) do drzewa zmian.
+3. Nowy `installed.xml` (baza + bloki nowych pakietów) dokładany do drzewa zmian.
+4. `ft::api::stage_layered` (derive: baza + zmiany → nowy tag) → `ft::api::deploy` (composefs + dm-verity + atomowa podmiana `current`).
+5. Restart ⇒ nowy system; `lpm rollback` = `ft::api::rollback`.
+`lpm remove` przebudowuje od obrazu bazowego z RPM-ów pozostałych żądań (lista w `/state/lpm/requests/*.list`, bloki `*.blocks`, baza `/state/lpm/base-installed.xml`).
 
-## Przepływ `lpm add` (nix-like)
-Dla każdego RPM z domknięcia: `store/<h32>-<nazwa>-<ver>/{content,wrap,meta.toml}`, hash z (nazwa, wersja, arch, skrót RPM, hashe zależności).
-Wrapper `LD_LIBRARY_PATH` = własne lib + closure + `/run/opengl-driver/lib` (na końcu). Generacja profilu = farma symlinków,
-`profiles/current` przełączany atomowo. Konflikt plików w profilu jest **raportowany**, nie psuje bibliotek.
-Cykle zależności RPM są przecinane (DFS) i zgłaszane ostrzeżeniem.
+## Zasady użycia bibliotek (zob. ../libfasttree/docs/USING-AS-LIBRARY.md)
+* importy bit tylko w `main.h#`; wywołania `ft::api::…`/`rp::…`; typy w pozycji typu przez nazwę modułu (`lpath::Node`);
+* żadnych pól struktur lpm z typami bibliotek, żadnych literałów struktur bibliotek (N2) — konstruktory i fasady są w bibliotekach.
 
-## Niezmienność
-`/system` — composefs (ro). `/state`, `/packages`, `/tools` — montowane `ro`; operacje lpm robią `remount,rw` na czas transakcji i
-wracają do `ro` (także przy błędzie). Poza punktami montowania (testy, chroot) wywołania są no-op.
+## Czego nadal brakuje
+`lpm triggers` obsługuje sysusers i polecenia z `[hooks]`; `tmpfiles.d`, `alternatives`, `authselect` — nie (ROADMAP M2).
