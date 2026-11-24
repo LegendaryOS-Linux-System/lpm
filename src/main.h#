@@ -1,0 +1,202 @@
+use "bit -> libfasttree" from "ft"
+use "bit -> lrpm" from "rp"
+use "bit -> colors"
+use "bit -> nidus" from "nidus"
+use "bit -> progress-bar" from "pb"
+use "std -> env" from "env"
+mod ui
+mod config
+mod plan
+mod rpmio
+mod journal
+mod layer
+mod pkgs
+mod toolcmd
+mod status
+
+fn usage() -> string is
+    return "lpm — LegendaryOS Package Manager 0.1.0\n\nSystem (warstwy w obrazie, restart):\n  lpm install <pkg>...     dołóż pakiety Fedory do obrazu systemu (nowy deployment)\n  lpm remove  <pkg>...     usuń warstwę (przebudowa od bazy)\n  lpm upgrade              pobierz nowy obraz bazowy (OCI)\n  lpm deploy <tag>         wdróż istniejący tag FastTree\n  lpm rollback             wróć do poprzedniego wdrożenia\n  lpm deployments          lista wdrożeń\n\nPakiety użytkowe (/packages, styl nix, bez restartu):\n  lpm add <pkg>...   lpm del <pkg>...   lpm pkgs   lpm gen   lpm gen-rollback   lpm gc\n\nNarzędzia (/tools, squashfs):\n  lpm tools add <nazwa> [git entry] | add-all | update <n> | list | catalog | mount-all | path <n> | remove <n>\n\nInne: lpm sync (odśwież metadane rpm-md) | search <fraza> | status | doctor | layout-init | layout-check | triggers | version\nOpcje: --root DIR  --dry-run  -y"
+end
+
+;; Wyzwalacze po zmianie wdrożenia (zenitd: legendary-triggers.service): sysusers + hooki z compat.hk.
+;; Uruchamiane tylko, gdy installed.xml zmienił się od ostatniego razu (stempel sha256) — zamiennik
+;; skryptletów RPM, których lpm nie wykonuje.
+fn triggers(c: config::Config) -> int is
+    let ix: string = config::installed_xml(c)
+    let stamp: string = ft::text::path_join(ft::api::path_lpm_dir(c.root), "triggers.done")
+    let h: sys::Exec = ft::sys::exec("sha256sum " + ft::sys::sq(ix))
+    let cur: string = ft::text::split(ft::text::trim(h.out), " ")[0]
+    if !c.dry_run is
+        let old: string = ft::text::trim(ft::sys::read_text(stamp))
+        if old == cur && cur != "" is
+            ui::ok("wyzwalacze: bez zmian")
+            return 0
+        end
+    end
+    if !config::is_root() && !c.dry_run is
+        ui::err("lpm triggers wymaga roota")
+        return 1
+    end
+    if c.dry_run is
+        ui::ok("dry-run: uruchomiłbym sysusers i hooki z " + c.policy_file)
+        return 0
+    end
+    let res: [string] = rp::txn::run_triggers(c.root, c.policy_file)
+    if res[0] != "" is
+        ui::err(res[0])
+        return 1
+    end
+    let mut i: int = 1
+    while i < res.len() is
+        ui::warn(res[i])
+        i += 1
+    end
+    ft::sys::mkdir_p(ft::text::dirname(stamp))
+    let w: bool = ft::sys::write_text(stamp, cur)
+    ui::ok("wyzwalacze wykonane")
+    return 0
+end
+
+fn main() -> int is
+    let argv: [string] = env::args()
+    let mut args: [string] = []
+    let mut root: string = ""
+    let mut dry: bool = false
+    let mut yes: bool = false
+    let mut i: int = 1
+    while i < argv.len() is
+        let a: string = argv[i]
+        i += 1
+        if a == "--dry-run" is
+            dry = true
+        else is
+            if a == "-y" || a == "--yes" is
+                yes = true
+            else is
+                if a == "--root" && i < argv.len() is
+                    root = argv[i]
+                    i += 1
+                else is
+                    args.push(a)
+                end
+            end
+        end
+    end
+    if args.len() == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" is
+        write(usage())
+        return 0
+    end
+    if args[0] == "version" || args[0] == "--version" is
+        write("lpm 0.2.0 (libfasttree " + ft::api::version() + ", bez dnf: lrpm/satsolv)")
+        return 0
+    end
+    if root == "" is root = "/" end
+    let lr: config::LoadResult = config::load(root, dry, yes)
+    if !lr.ok is return 1 end
+    let c: config::Config = lr.cfg
+    let cmd: string = args[0]
+    let mut rest: [string] = []
+    let mut k: int = 1
+    while k < args.len() is
+        rest.push(args[k])
+        k += 1
+    end
+    if cmd == "install" is return layer::install(c, rest) end
+    if cmd == "remove" is return layer::remove(c, rest) end
+    if cmd == "upgrade" is return layer::upgrade(c) end
+    if cmd == "rollback" is return layer::rollback(c) end
+    if cmd == "deploy" is
+        if rest.len() < 1 is
+            ui::err("lpm deploy <tag>")
+            return 1
+        end
+        return layer::deploy_tag(c, rest[0])
+    end
+    if cmd == "deployments" is
+        let rs: [string] = ft::api::deployments(c.root)
+        let mut d: int = 0
+        while d < rs.len() is
+            let f: [string] = ft::text::split(rs[d], rp::pure::tab())
+            if f.len() == 4 is write("  " + f[0] + "  gen=" + f[1] + "  " + f[2] + "  " + f[3]) end
+            d += 1
+        end
+        return 0
+    end
+    if cmd == "add" is return pkgs::add(c, rest) end
+    if cmd == "del" is return pkgs::del(c, rest) end
+    if cmd == "pkgs" is return pkgs::list(c) end
+    if cmd == "gen" is return pkgs::generations(c) end
+    if cmd == "gen-rollback" is return pkgs::rollback_profile(c) end
+    if cmd == "gc" is return pkgs::gc(c) end
+    if cmd == "search" is
+        if rest.len() < 1 is
+            ui::err("lpm search <fraza>")
+            return 1
+        end
+        let hits: [string] = rpmio::search(c, rest[0])
+        let mut h: int = 0
+        while h < hits.len() is
+            write("  " + hits[h])
+            h += 1
+        end
+        if hits.len() == 0 is ui::info("brak wyników (czy zsynchronizowano metadane? lpm sync)") end
+        return 0
+    end
+    if cmd == "sync" is
+        let se: string = rpmio::sync(c)
+        if se != "" is
+            ui::err(se)
+            return 1
+        end
+        ui::ok("metadane rpm-md odświeżone")
+        return 0
+    end
+    if cmd == "triggers" is return triggers(c) end
+    if cmd == "status" is return status::status(c) end
+    if cmd == "doctor" is return status::doctor(c) end
+    if cmd == "layout-init" is
+        ;; tworzy brakujące korzenie i /state (FastTree jako biblioteka; wołane przez legendary-state.service)
+        let le: string = ft::api::layout_ensure(c.root)
+        if le != "" is
+            ui::err(le)
+            return 1
+        end
+        return 0
+    end
+    if cmd == "layout-check" is
+        let p: [string] = ft::api::layout_validate(c.root)
+        let mut x: int = 0
+        while x < p.len() is
+            ui::warn(p[x])
+            x += 1
+        end
+        if p.len() == 0 is ui::ok("układ poprawny") end
+        if p.len() > 0 is return 1 end
+        return 0
+    end
+    if cmd == "tools" is
+        if rest.len() < 1 is
+            write(usage())
+            return 1
+        end
+        let sub: string = rest[0]
+        let mut a2: [string] = []
+        let mut y: int = 1
+        while y < rest.len() is
+            a2.push(rest[y])
+            y += 1
+        end
+        if sub == "add" is return toolcmd::add(c, a2) end
+        if sub == "add-all" is return toolcmd::add_all(c) end
+        if sub == "list" is return toolcmd::list(c) end
+        if sub == "catalog" is return toolcmd::catalog(c) end
+        if sub == "mount-all" is return toolcmd::mount_all(c) end
+        if sub == "update" && a2.len() > 0 is return toolcmd::update(c, a2[0]) end
+        if sub == "path" && a2.len() > 0 is return toolcmd::path(c, a2[0]) end
+        if sub == "remove" && a2.len() > 0 is return toolcmd::remove(c, a2[0]) end
+        ui::err("nieznana podkomenda tools: " + sub)
+        return 1
+    end
+    ui::err("nieznana komenda: " + cmd + " (lpm help)")
+    return 1
+end
