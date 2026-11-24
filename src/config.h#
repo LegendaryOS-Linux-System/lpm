@@ -1,0 +1,116 @@
+use "std -> fs" from "fs"
+mod ui
+
+;; Konfiguracja lpm: /system/share/legendaryos/lpm.hk (domyślna, z obrazu),
+;; nadpisywana przez /state/etc/lpm/lpm.hk. lpm NIE używa dnf — backend to zawsze satsolv (biblioteka lrpm).
+;;
+;;   [lpm]
+;;   -> releasever       => 43
+;;   -> arch             => x86_64
+;;   -> base-image       => ghcr.io/legendaryos/legendaryos:latest
+;;   -> keep-generations => 3
+;;   -> repos            => /system/share/legendaryos/repos.hk   ;; repozytoria rpm-md (nadpisanie: /state/etc/lpm/repos.hk)
+;;   -> policy           => /system/share/legendaryos/compat.hk  ;; atrapy systemd, wykluczenia, hooki
+;;   [tools]
+;;   -> catalog          => /system/share/legendaryos/tools.hk
+;;
+;; Config trzyma WYŁĄCZNIE typy proste (w tym `root: string` zamiast `layout::Layout`) — H# 0.9 psuje
+;; pola struktur o typach z aliasu biblioteki (Z-SHARP-GAPS N2).
+
+pub struct Config is
+    pub root:             string   ;; "/" albo katalog testowy (--root)
+    pub releasever:       string
+    pub arch:             string
+    pub base_image:       string
+    pub keep_generations: int
+    pub tools_catalog:    string
+    pub repos_file:       string
+    pub policy_file:      string
+    pub dry_run:          bool
+    pub assume_yes:       bool
+end
+
+pub fn system(c: Config) -> string is return ft::api::path_system(c.root) end
+pub fn ft_root(c: Config) -> string is return ft::api::path_ft_root(c.root) end
+pub fn cache(c: Config) -> string is return ft::api::path_lpm_cache(c.root) end
+
+;; installed.xml systemu (baza dla solvera) — jedzie w obrazie, zob. lrpm/docs/ARCHITECTURE.md.
+pub fn installed_xml(c: Config) -> string is
+    return ft::text::path_join(system(c), "share/legendaryos/installed.xml")
+end
+
+;; Kopia installed.xml obrazu BAZOWEGO (do przebudowy warstw przy `lpm remove`).
+pub fn base_installed_xml(c: Config) -> string is
+    return ft::text::path_join(ft::api::path_lpm_dir(c.root), "base-installed.xml")
+end
+
+pub fn defaults(root: string) -> Config is
+    let sys_dir: string = ft::api::path_system(root)
+    return Config { root: root, releasever: "43", arch: "x86_64",
+        base_image: "ghcr.io/legendaryos/legendaryos:latest", keep_generations: 3,
+        tools_catalog: ft::text::path_join(sys_dir, "share/legendaryos/tools.hk"),
+        repos_file: ft::text::path_join(sys_dir, "share/legendaryos/repos.hk"),
+        policy_file: ft::text::path_join(sys_dir, "share/legendaryos/compat.hk"),
+        dry_run: false, assume_yes: false }
+end
+
+fn apply(c: Config, p: string) -> Config is
+    return Config { root: c.root,
+        releasever: ft::api::hk_get(p, "lpm", "releasever", c.releasever),
+        arch: ft::api::hk_get(p, "lpm", "arch", c.arch),
+        base_image: ft::api::hk_get(p, "lpm", "base-image", c.base_image),
+        keep_generations: ft::api::hk_get_int(p, "lpm", "keep-generations", c.keep_generations),
+        tools_catalog: ft::api::hk_get(p, "tools", "catalog", c.tools_catalog),
+        repos_file: ft::api::hk_get(p, "lpm", "repos", c.repos_file),
+        policy_file: ft::api::hk_get(p, "lpm", "policy", c.policy_file),
+        dry_run: c.dry_run, assume_yes: c.assume_yes }
+end
+
+pub struct LoadResult is
+    pub ok:  bool
+    pub cfg: Config
+end
+
+pub fn load(root: string, dry_run: bool, yes: bool) -> LoadResult is
+    let d0: Config = defaults(root)
+    let mut c: Config = Config { root: d0.root, releasever: d0.releasever, arch: d0.arch, base_image: d0.base_image,
+        keep_generations: d0.keep_generations, tools_catalog: d0.tools_catalog, repos_file: d0.repos_file,
+        policy_file: d0.policy_file, dry_run: dry_run, assume_yes: yes }
+    let paths: [string] = [ft::text::path_join(system(c), "share/legendaryos/lpm.hk"),
+                           ft::text::path_join(ft::api::path_state_etc(root), "lpm/lpm.hk")]
+    let mut i: int = 0
+    while i < paths.len() is
+        let p: string = paths[i]
+        i += 1
+        if fs::exists(p) is
+            let e: string = ft::api::hk_check(p)
+            if e != "" is
+                ui::config_error(p, fs::read(p), "", e, "popraw składnię pliku .hk")
+                return LoadResult { ok: false, cfg: c }
+            end
+            if ft::api::hk_get(p, "lpm", "backend", "satsolv") == "dnf" is
+                ui::err(p + ": backend dnf nie istnieje — lpm używa satsolv (system nie ma dnf)")
+                return LoadResult { ok: false, cfg: c }
+            end
+            c = apply(c, p)
+        end
+    end
+    ;; użytkownik może nadpisać repozytoria plikiem w /state/etc/lpm/repos.hk
+    let user_repos: string = ft::text::path_join(ft::api::path_state_etc(root), "lpm/repos.hk")
+    if fs::exists(user_repos) is
+        c = Config { root: c.root, releasever: c.releasever, arch: c.arch, base_image: c.base_image,
+            keep_generations: c.keep_generations, tools_catalog: c.tools_catalog, repos_file: user_repos,
+            policy_file: c.policy_file, dry_run: c.dry_run, assume_yes: c.assume_yes }
+    end
+    return LoadResult { ok: true, cfg: c }
+end
+
+pub fn now_iso() -> string is
+    let r: sys::Exec = ft::sys::exec("date -u +%Y-%m-%dT%H:%M:%SZ")
+    return ft::text::trim(r.out)
+end
+
+pub fn is_root() -> bool is
+    let r: sys::Exec = ft::sys::exec("id -u")
+    return ft::text::trim(r.out) == "0"
+end
