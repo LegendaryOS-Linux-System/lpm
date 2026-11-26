@@ -2,177 +2,304 @@ use "std -> fs" from "fs"
 mod ui
 mod config
 
-;; /tools: narzędzia HackerOS i Zenit Linux (git -> squashfs, montowane ro).
-;; Całość przez fasadę libfasttree (ft::api::tool_*, ft::api::hk_*) — typy proste, brak struktur z biblioteki.
-;; Katalog narzędzi (tools.hk, dostarczany w obrazie):
-;;   [tools]
-;;   -> hacker
-;;   --> git   => https://github.com/HackerOS-Linux-System/hacker
-;;   --> entry => bin/hacker
-;;   --> build => ""                ;; opcjonalne polecenie budowy
+;; /tools = JEDEN obraz squashfs (tools.sqfs) ze wszystkimi narzędziami, montowany tylko do odczytu na /tools.
+;; Całość przez fasadę libfasttree (ft::api::tb_*): typy proste, brak struktur z biblioteki.
+;;
+;;   obraz fabryczny    /tools/tools.sqfs          (z obrazu systemu, budowany przez legendaryos-builder)
+;;   obraz zaktualizowany /state/tools/tools.sqfs  (`lpm tools update`; ma pierwszeństwo, `rollback` go usuwa)
+;;   katalog narzędzi   /system/share/legendaryos/tools.hk  (te same źródła wersji co w builderze)
+;;
+;; Nic nie jest rozpakowywane: jądro montuje squashfs (loop), narzędzia uruchamiają się prosto z /tools/bin.
 
-pub fn catalog_names(path: string) -> [string] is
-    let mut out: [string] = []
-    let ks: [string] = ft::api::hk_keys(path, "tools")
-    let mut i: int = 0
-    while i < ks.len() is
-        if ft::text::ends_with(ks[i], ".git") is out.push(ks[i][0..ks[i].len() - 4]) end
-        i += 1
-    end
-    return out
-end
+fn tabc() -> string is return __builtin_char_code_to_str(9) end
 
 fn need_root(c: config::Config) -> bool is
     if c.dry_run || config::is_root() is return true end
-    ui::err("ta operacja wymaga roota (/tools jest tylko do odczytu)")
+    ui::err("ta operacja wymaga roota")
     return false
 end
 
-fn catalog_err(c: config::Config) -> string is return ft::api::hk_check(c.tools_catalog) end
+;; Edycja systemu: manifest.toml [os] edition, a w razie braku edition.hk z obrazu.
+pub fn edition(c: config::Config) -> string is
+    let e: string = ft::api::system_manifest_get(c.root, "os", "edition")
+    if e != "" is return e end
+    let f: string = ft::text::path_join(config::system(c), "share/legendaryos/edition.hk")
+    if fs::exists(f) is return ft::api::hk_get(f, "edition", "id", "") end
+    return ""
+end
 
-;; Pakuje narzędzie (git → squashfs). `build` może być "".
-pub fn pack_one(c: config::Config, name: string, git: string, rev: string, entry: string, build: string) -> int is
-    if git == "" is
-        ui::err("narzędzie '" + name + "' nie ma adresu git w katalogu")
-        return 1
-    end
-    ui::info("klonowanie i pakowanie " + name + " (" + git + ")")
+fn tools_cache(c: config::Config) -> string is
+    return ft::text::path_join(config::cache(c), "tools")
+end
+
+fn kib(n: int) -> string is return ft::text::istr(n / 1024) + " KiB" end
+
+;; lpm tools mount-all [--remount] — wołane przez legendary-tools.service przy starcie.
+pub fn mount_all(c: config::Config, remount: bool) -> int is
     if c.dry_run is
-        ui::ok("dry-run: " + name)
+        ui::info("dry-run: zamontowano by " + ft::api::tb_active_image(c.root) + " na /tools")
         return 0
     end
-    let ue: string = ft::api::layout_unlock(c.root)
-    if ue != "" is
-        ui::err(ue)
+    let mut e: string = ""
+    if remount is e = ft::api::tb_remount(c.root) else is e = ft::api::tb_mount(c.root) end
+    if e != "" is
+        ui::err("/tools: " + e)
         return 1
     end
-    let r: [string] = ft::api::tool_pack(c.root, name, git, rev, entry, build)
-    let le: string = ft::api::layout_lock(c.root)
-    if r[0] != "" is
-        ui::err(r[0])
-        return 1
-    end
-    ui::ok(name + " @ " + r[1][0..12] + "  " + ft::text::istr(ft::text::parse_int(r[2], 0) / 1024) + " KiB (squashfs zstd)")
     return 0
 end
 
-fn pack_from_catalog(c: config::Config, name: string) -> int is
-    let p: string = c.tools_catalog
-    return pack_one(c, name, ft::api::hk_get(p, "tools", name + ".git", ""), ft::api::hk_get(p, "tools", name + ".rev", ""),
-        ft::api::hk_get(p, "tools", name + ".entry", ""), ft::api::hk_get(p, "tools", name + ".build", ""))
-end
-
-;; lpm tools add <nazwa> [git entry]  — z katalogu albo jawnie
-pub fn add(c: config::Config, args: [string]) -> int is
-    if args.len() == 0 is
-        ui::err("lpm tools add <nazwa> [<git> <entry>]")
+pub fn status(c: config::Config) -> int is
+    ui::head("narzędzia (/tools)")
+    let active: string = ft::api::tb_active_image(c.root)
+    let fac: string = ft::api::tb_factory_image(c.root)
+    let ov: string = ft::api::tb_override_image(c.root)
+    if active == "" is
+        ui::warn("brak obrazu narzędzi (" + fac + ")")
         return 1
     end
-    if !need_root(c) is return 1 end
-    if args.len() >= 3 is return pack_one(c, args[0], args[1], "", args[2], "") end
-    let ce: string = catalog_err(c)
-    if ce != "" is
-        ui::err("katalog narzędzi: " + ce)
-        return 1
+    let mut kind: string = "fabryczny"
+    if active == ov is kind = "zaktualizowany (lpm tools update)" end
+    ui::kv("obraz", active)
+    ui::kv("rodzaj", kind)
+    ui::kv("rozmiar", kib(fs::size(active)))
+    ui::kv("sha256", ft::api::tb_sha256(active)[0..16])
+    let mut mounted: string = "nie"
+    if ft::api::tb_is_mounted(c.root) is mounted = "tak (ro)" end
+    ui::kv("zamontowany", mounted)
+    ui::kv("edycja", edition(c))
+    if ft::api::tb_is_mounted(c.root) is
+        let n: int = ft::api::tb_list(c.root).len()
+        ui::kv("narzędzi", ft::text::istr(n))
+        ui::kv("zbudowano", ft::api::tb_index_get(c.root, "image", "created"))
     end
-    return pack_from_catalog(c, args[0])
-end
-
-pub fn add_all(c: config::Config) -> int is
-    if !need_root(c) is return 1 end
-    let ce: string = catalog_err(c)
-    if ce != "" is
-        ui::err("katalog narzędzi: " + ce)
-        return 1
-    end
-    let names: [string] = catalog_names(c.tools_catalog)
-    let mut fails: int = 0
-    let mut i: int = 0
-    while i < names.len() is
-        if pack_from_catalog(c, names[i]) != 0 is fails += 1 end
-        i += 1
-    end
-    return fails
-end
-
-pub fn update(c: config::Config, name: string) -> int is
-    if !need_root(c) is return 1 end
-    let git: string = ft::api::tool_meta(c.root, name, "git")
-    if git == "" is
-        ui::err("narzędzie '" + name + "' nie jest zainstalowane")
-        return 1
-    end
-    return pack_one(c, name, git, ft::api::tool_meta(c.root, name, "rev"), ft::api::tool_meta(c.root, name, "entry"), "")
+    if fs::exists(ov) && active != ov is ui::warn("istnieje " + ov + ", ale jest niepoprawny — używam obrazu fabrycznego") end
+    return 0
 end
 
 pub fn list(c: config::Config) -> int is
-    let t: [string] = ft::api::tool_list(c.root)
-    let mut i: int = 0
-    while i < t.len() is
-        let mut mark: string = "odmontowane"
-        if ft::api::tool_is_mounted(c.root, t[i]) is mark = "zamontowane" end
-        write("  " + t[i] + "  " + ft::api::tool_meta(c.root, t[i], "commit")[0..12] + "  " + mark)
-        i += 1
-    end
-    if t.len() == 0 is ui::info("brak zainstalowanych narzędzi (lpm tools add-all)") end
-    return 0
-end
-
-pub fn catalog(c: config::Config) -> int is
-    let ce: string = catalog_err(c)
-    if ce != "" is
-        ui::err("katalog narzędzi (" + c.tools_catalog + "): " + ce)
+    let m: string = ft::api::tb_mount(c.root)
+    if m != "" is
+        ui::err("/tools: " + m)
         return 1
     end
-    let names: [string] = catalog_names(c.tools_catalog)
+    let rows: [string] = ft::api::tb_list(c.root)
     let mut i: int = 0
-    while i < names.len() is
-        write("  " + names[i] + "  " + ft::api::hk_get(c.tools_catalog, "tools", names[i] + ".git", ""))
+    while i < rows.len() is
+        let f: [string] = ft::text::split(rows[i], tabc())
+        let mut sha: string = ""
+        if f.len() > 3 && f[3].len() >= 8 is sha = f[3][0..8] end
+        let mut asn: string = f[0]
+        if f.len() > 4 is asn = f[4] end
+        write("  " + asn + "  " + f[1] + "  " + f[2] + "  " + sha)
         i += 1
     end
+    if rows.len() == 0 is ui::info("obraz nie ma indeksu TOOLS.hk albo jest pusty") end
     return 0
-end
-
-pub fn mount_all(c: config::Config) -> int is
-    let t: [string] = ft::api::tool_list(c.root)
-    let mut fails: int = 0
-    let mut i: int = 0
-    while i < t.len() is
-        let e: string = ft::api::tool_mount(c.root, t[i])
-        if e != "" is
-            ui::err(t[i] + ": " + e)
-            fails += 1
-        end
-        i += 1
-    end
-    return fails
 end
 
 ;; Zamontuj (jeśli trzeba) i wypisz ścieżkę pliku wykonywalnego — używa jej `legendary-tool`.
 pub fn path(c: config::Config, name: string) -> int is
-    let e: string = ft::api::tool_mount(c.root, name)
-    if e != "" is
-        ui::err(e)
-        return 1
-    end
-    let p: string = ft::api::tool_entry_path(c.root, name)
+    let p: string = ft::api::tb_path(c.root, name)
     if p == "" is
-        ui::err("narzędzie '" + name + "' nie ma zdefiniowanego entry")
+        ui::err("narzędzie '" + name + "' nie istnieje w /tools (lpm tools list)")
         return 1
     end
     write(p)
     return 0
 end
 
-pub fn remove(c: config::Config, name: string) -> int is
-    if !need_root(c) is return 1 end
-    let ue: string = ft::api::layout_unlock(c.root)
-    let e: string = ft::api::tool_remove(c.root, name)
-    let le: string = ft::api::layout_lock(c.root)
-    if e != "" is
-        ui::err(e)
+;; Sprawdza obraz i sumy sha256 każdego narzędzia z indeksu TOOLS.hk.
+pub fn verify(c: config::Config) -> int is
+    let active: string = ft::api::tb_active_image(c.root)
+    if active == "" is
+        ui::err("brak obrazu narzędzi")
         return 1
     end
-    ui::ok("usunięto " + name)
+    let ve: string = ft::api::tb_verify(active)
+    if ve != "" is
+        ui::err(active + ": " + ve)
+        return 1
+    end
+    ui::ok("obraz squashfs poprawny: " + active)
+    let m: string = ft::api::tb_mount(c.root)
+    if m != "" is
+        ui::err("/tools: " + m)
+        return 1
+    end
+    let rows: [string] = ft::api::tb_list(c.root)
+    let mut bad: int = 0
+    let mut i: int = 0
+    while i < rows.len() is
+        let f: [string] = ft::text::split(rows[i], tabc())
+        i += 1
+        let asn: string = f[4]
+        let p: string = ft::api::tb_path(c.root, asn)
+        if p == "" is
+            ui::err(asn + ": brak pliku w /tools/bin")
+            bad += 1
+        else is
+            let sha: string = ft::api::tb_sha256(p)
+            if sha != f[3] is
+                ui::err(asn + ": suma sha256 nie zgadza się z indeksem")
+                bad += 1
+            end
+        end
+    end
+    if bad == 0 is ui::ok("sumy sha256 " + ft::text::istr(rows.len()) + " narzędzi zgodne z indeksem") end
+    if bad > 0 is return 1 end
+    return 0
+end
+
+;; Katalog narzędzi dla edycji tego systemu (z wersjami/źródłami).
+pub fn catalog(c: config::Config) -> int is
+    let ce: string = ft::api::hk_check(c.tools_catalog)
+    if ce != "" is
+        ui::err("katalog narzędzi (" + c.tools_catalog + "): " + ce)
+        return 1
+    end
+    let probs: [string] = ft::api::tb_catalog_check(c.tools_catalog)
+    let mut k: int = 0
+    while k < probs.len() is
+        ui::warn(probs[k])
+        k += 1
+    end
+    let rows: [string] = ft::api::tb_catalog_list(c.tools_catalog, edition(c), [])
+    let mut i: int = 0
+    while i < rows.len() is
+        let f: [string] = ft::text::split(rows[i], tabc())
+        write("  " + f[1] + "  " + f[5] + "  ←  github.com/" + f[6])
+        i += 1
+    end
+    return 0
+end
+
+fn has_id(rows: [string], id: string) -> string is
+    let mut i: int = 0
+    while i < rows.len() is
+        let f: [string] = ft::text::split(rows[i], tabc())
+        if f[0] == id is return rows[i] end
+        i += 1
+    end
+    return ""
+end
+
+;; lpm tools update [--allow-missing] [--offline]
+;; Ponownie ustala wersje (manifest.hk / Bit.hk), pobiera brakujące wydania do cache, składa NOWY obraz i instaluje go atomowo
+;; jako /state/tools/tools.sqfs. Narzędzie, którego wydania nie ma (404), zostaje w dotychczasowej wersji (jeśli już jest w obrazie).
+pub fn update(c: config::Config, allow_missing: bool, offline: bool) -> int is
+    if !need_root(c) is return 1 end
+    let ce: string = ft::api::hk_check(c.tools_catalog)
+    if ce != "" is
+        ui::err("katalog narzędzi: " + ce)
+        return 1
+    end
+    let ed: string = edition(c)
+    ui::info("edycja: " + ed + ", katalog: " + c.tools_catalog)
+    if c.dry_run is
+        let want: [string] = ft::api::tb_catalog_list(c.tools_catalog, ed, [])
+        ui::ok("dry-run: zaktualizowano by " + ft::text::istr(want.len()) + " narzędzi")
+        return 0
+    end
+    let m: string = ft::api::tb_mount(c.root)
+    let current: [string] = ft::api::tb_list(c.root)
+    let rows: [string] = ft::api::tb_fetch(c.tools_catalog, ed, [], tools_cache(c), "", offline)
+    let mut good: [string] = []
+    let mut bad: int = 0
+    let mut changed: int = 0
+    let mut i: int = 0
+    while i < rows.len() is
+        let row: string = rows[i]
+        let f: [string] = ft::text::split(row, tabc())
+        i += 1
+        if f[0] == "OK" || f[0] == "WARN" is
+            good.push(row)
+            let old: string = has_id(current, f[1])
+            let mut same: bool = false
+            if old != "" is
+                let of: [string] = ft::text::split(old, tabc())
+                if of[3] == f[5] is same = true end
+            end
+            if !same is
+                changed += 1
+                ui::ok(f[1] + " " + f[3])
+            end
+            if f[0] == "WARN" && f.len() > 10 is ui::warn(f[1] + ": " + f[10]) end
+        else is
+            if f[0] == "ERR" is
+                let old2: string = has_id(current, f[1])
+                let mut msg: string = ""
+                if f.len() > 10 is msg = f[10] end
+                if old2 != "" is
+                    ;; zostaje dotychczasowa wersja z obecnego obrazu
+                    let of2: [string] = ft::text::split(old2, tabc())
+                    let ap: string = ft::api::tb_path(c.root, of2[4])
+                    if ap != "" is
+                        let mut sysf: string = "0"
+                        if f.len() > 7 is sysf = f[7] end
+                        good.push("OK" + tabc() + f[1] + tabc() + of2[4] + tabc() + of2[1] + tabc() + ft::text::istr(fs::size(ap)) + tabc() + of2[3] + tabc() + "image" + tabc() + sysf + tabc() + of2[2] + tabc() + ap + tabc())
+                        ui::warn(f[1] + ": " + msg + " — zostaje " + of2[1])
+                    else is
+                        bad += 1
+                        ui::err(f[1] + ": " + msg)
+                    end
+                else is
+                    if allow_missing is
+                        ui::warn(f[1] + " pominięte: " + msg)
+                    else is
+                        bad += 1
+                        ui::err(f[1] + ": " + msg)
+                    end
+                end
+            end
+        end
+    end
+    if bad > 0 is
+        ui::err("aktualizacja przerwana (" + ft::text::istr(bad) + " błędów); dotychczasowy obraz bez zmian. --allow-missing pomija narzędzia bez wydań")
+        return 1
+    end
+    if good.len() == 0 is
+        ui::err("nic do zapisania")
+        return 1
+    end
+    let stage: string = ft::text::path_join(config::cache(c), "tools-stage")
+    let se: string = ft::api::tb_stage(stage, good, c.tools_catalog, ed, ft::api::system_manifest_get(c.root, "os", "version"), now())
+    if se != "" is
+        ui::err(se)
+        return 1
+    end
+    let img: string = ft::text::path_join(config::cache(c), "tools-new.sqfs")
+    let pk: [string] = ft::api::tb_pack(stage, img)
+    ft::sys::rm_rf(stage)
+    if pk[0] != "" is
+        ui::err(pk[0])
+        return 1
+    end
+    let ie: string = ft::api::tb_install_override(c.root, img)
+    ft::sys::rm_f(img)
+    if ie != "" is
+        ui::err(ie)
+        return 1
+    end
+    ui::ok("nowy obraz /tools: " + kib(ft::text::parse_int(pk[1], 0)) + ", zmienionych narzędzi: " + ft::text::istr(changed))
+    ui::info("aktywny po restarcie albo: lpm tools mount-all --remount (gdy żadne narzędzie z /tools nie działa)")
+    return 0
+end
+
+fn now() -> string is
+    let r: sys::Exec = ft::sys::exec("date -u +%Y-%m-%dT%H:%M:%SZ")
+    return ft::text::trim(r.out)
+end
+
+;; Wraca do obrazu fabrycznego (usuwa /state/tools/tools.sqfs).
+pub fn rollback(c: config::Config) -> int is
+    if !need_root(c) is return 1 end
+    let ov: string = ft::api::tb_override_image(c.root)
+    if !fs::exists(ov) is
+        ui::info("brak zaktualizowanego obrazu — używany jest fabryczny")
+        return 0
+    end
+    ft::api::tb_remove_override(c.root)
+    ui::ok("usunięto " + ov + " — po restarcie (albo mount-all --remount) wraca obraz fabryczny")
     return 0
 end
