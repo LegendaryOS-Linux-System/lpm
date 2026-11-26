@@ -23,7 +23,16 @@ pub fn status(c: config::Config) -> int is
     let pend: string = ft::api::pending_tag(root)
     if pend != "" is ui::kv("oczekujące", pend + "  (aktywne po restarcie)") end
     ui::kv("profil", "generacja " + ft::text::istr(ft::api::profile_generation(root)) + ", korzeni: " + ft::text::istr(ft::api::profile_roots(root).len()))
-    ui::kv("narzędzia", ft::text::istr(ft::api::tool_count(root)))
+    let ed: string = ft::api::system_manifest_get(root, "os", "edition")
+    if ed != "" is ui::kv("edycja", ed) end
+    let timg: string = ft::api::tb_active_image(root)
+    if timg == "" is
+        ui::kv("narzędzia", "brak obrazu /tools")
+    else is
+        let mut tstate: string = "odmontowany"
+        if ft::api::tb_is_mounted(root) is tstate = "zamontowany" end
+        ui::kv("narzędzia", ft::text::path_join("", timg) + " (" + tstate + ")")
+    end
     let st: string = journal::stale(root)
     if st != "" is ui::warn("przerwana transakcja: " + st + " (zostanie wyczyszczona przy następnej operacji)") end
     return 0
@@ -60,7 +69,21 @@ pub fn doctor(c: config::Config) -> int is
         ui::warn("brak " + config::installed_xml(c) + " — solver nie zna bazy systemu (obraz zbudowany bez lepm?)")
         bad += 1
     end
-    let need: [string] = ["git", "mksquashfs", "curl", "gawk", "bsdtar", "zstd", "sha256sum", "rpm", "mkcomposefs", "veritysetup"]
+    let timg: string = ft::api::tb_active_image(c.root)
+    if timg == "" is
+        ui::warn("brak obrazu narzędzi " + ft::api::tb_factory_image(c.root))
+        bad += 1
+    else is
+        let ve: string = ft::api::tb_verify(timg)
+        if ve != "" is
+            ui::warn("obraz narzędzi: " + ve)
+            bad += 1
+        else is
+            ui::ok("obraz narzędzi: " + timg)
+        end
+    end
+    if !ft::sys::have_tool("lpm") && !fs::exists(ft::text::path_join(config::system(c), "bin/lpm")) is ui::warn("brak lpm w /system/bin") end
+    let need: [string] = ["git", "mksquashfs", "squashfuse", "curl", "gawk", "bsdtar", "zstd", "sha256sum", "rpm", "mkcomposefs", "veritysetup"]
     let mut t: int = 0
     while t < need.len() is
         if ft::sys::have_tool(need[t]) is ui::ok("narzędzie: " + need[t]) else is
