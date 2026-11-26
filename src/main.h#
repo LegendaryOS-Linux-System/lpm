@@ -13,9 +13,10 @@ mod layer
 mod pkgs
 mod toolcmd
 mod status
+mod solvecmd
 
 fn usage() -> string is
-    return "lpm — LegendaryOS Package Manager 0.1.0\n\nSystem (warstwy w obrazie, restart):\n  lpm install <pkg>...     dołóż pakiety Fedory do obrazu systemu (nowy deployment)\n  lpm remove  <pkg>...     usuń warstwę (przebudowa od bazy)\n  lpm upgrade              pobierz nowy obraz bazowy (OCI)\n  lpm deploy <tag>         wdróż istniejący tag FastTree\n  lpm rollback             wróć do poprzedniego wdrożenia\n  lpm deployments          lista wdrożeń\n\nPakiety użytkowe (/packages, styl nix, bez restartu):\n  lpm add <pkg>...   lpm del <pkg>...   lpm pkgs   lpm gen   lpm gen-rollback   lpm gc\n\nNarzędzia (/tools, squashfs):\n  lpm tools add <nazwa> [git entry] | add-all | update <n> | list | catalog | mount-all | path <n> | remove <n>\n\nInne: lpm sync (odśwież metadane rpm-md) | search <fraza> | status | doctor | layout-init | layout-check | triggers | version\nOpcje: --root DIR  --dry-run  -y"
+    return "lpm — LegendaryOS Package Manager 0.3.0\n\nSystem (warstwy w obrazie, restart):\n  lpm install <pkg>...     dołóż pakiety Fedory do obrazu systemu (nowy deployment)\n  lpm remove  <pkg>...     usuń warstwę (przebudowa od bazy)\n  lpm upgrade              pobierz nowy obraz bazowy (OCI)\n  lpm deploy <tag>         wdróż istniejący tag FastTree\n  lpm rollback             wróć do poprzedniego wdrożenia\n  lpm deployments          lista wdrożeń\n\nPakiety użytkowe (/packages, styl nix, bez restartu):\n  lpm add <pkg>...   lpm del <pkg>...   lpm pkgs   lpm gen   lpm gen-rollback   lpm gc\n\nNarzędzia (/tools = jeden obraz squashfs):\n  lpm tools list | status | verify | catalog | path <n> | mount-all [--remount]\n  lpm tools update [--allow-missing] [--offline] | rollback\n\nSolver (satsolv, tylko plan względem systemu):\n  lpm solve <spec>... | --erase S [--opt cleandeps] | --update S | --update-all | --dist-upgrade | --verify  [--opt O]\n\nInne: lpm clean (cache) | lpm sync (odśwież metadane rpm-md) | search <fraza> | status | doctor | layout-init | layout-check | triggers | version\nOpcje: --root DIR  --dry-run  -y"
 end
 
 ;; Wyzwalacze po zmianie wdrożenia (zenitd: legendary-triggers.service): sysusers + hooki z compat.hk.
@@ -87,7 +88,7 @@ fn main() -> int is
         return 0
     end
     if args[0] == "version" || args[0] == "--version" is
-        write("lpm 0.2.0 (libfasttree " + ft::api::version() + ", bez dnf: lrpm/satsolv)")
+        write("lpm 0.3.0 (libfasttree " + ft::api::version() + ", bez dnf: lrpm/satsolv)")
         return 0
     end
     if root == "" is root = "/" end
@@ -122,6 +123,7 @@ fn main() -> int is
         end
         return 0
     end
+    if cmd == "solve" is return solvecmd::run(c, rest) end
     if cmd == "add" is return pkgs::add(c, rest) end
     if cmd == "del" is return pkgs::del(c, rest) end
     if cmd == "pkgs" is return pkgs::list(c) end
@@ -149,6 +151,16 @@ fn main() -> int is
             return 1
         end
         ui::ok("metadane rpm-md odświeżone")
+        return 0
+    end
+    if cmd == "clean" is
+        let cdir: string = config::cache(c)
+        let du: sys::Exec = ft::sys::exec("du -sk " + ft::sys::sq(cdir) + " 2>/dev/null | cut -f1")
+        if !c.dry_run && fs::is_dir(cdir) is
+            ft::sys::rm_rf(cdir)
+            ft::sys::mkdir_p(cdir)
+        end
+        ui::ok("cache wyczyszczony (" + ft::text::trim(du.out) + " KiB): " + cdir)
         return 0
     end
     if cmd == "triggers" is return triggers(c) end
@@ -186,14 +198,30 @@ fn main() -> int is
             a2.push(rest[y])
             y += 1
         end
-        if sub == "add" is return toolcmd::add(c, a2) end
-        if sub == "add-all" is return toolcmd::add_all(c) end
+        let mut allow_missing: bool = false
+        let mut offline: bool = false
+        let mut remount: bool = false
+        let mut names: [string] = []
+        let mut z: int = 0
+        while z < a2.len() is
+            if a2[z] == "--allow-missing" is allow_missing = true
+            else is if a2[z] == "--offline" is offline = true
+            else is if a2[z] == "--remount" is remount = true
+            else is names.push(a2[z]) end end end
+            z += 1
+        end
         if sub == "list" is return toolcmd::list(c) end
+        if sub == "status" is return toolcmd::status(c) end
         if sub == "catalog" is return toolcmd::catalog(c) end
-        if sub == "mount-all" is return toolcmd::mount_all(c) end
-        if sub == "update" && a2.len() > 0 is return toolcmd::update(c, a2[0]) end
-        if sub == "path" && a2.len() > 0 is return toolcmd::path(c, a2[0]) end
-        if sub == "remove" && a2.len() > 0 is return toolcmd::remove(c, a2[0]) end
+        if sub == "verify" is return toolcmd::verify(c) end
+        if sub == "mount-all" || sub == "mount" is return toolcmd::mount_all(c, remount) end
+        if sub == "update" is return toolcmd::update(c, allow_missing, offline) end
+        if sub == "rollback" is return toolcmd::rollback(c) end
+        if sub == "path" && names.len() > 0 is return toolcmd::path(c, names[0]) end
+        if sub == "add" || sub == "add-all" || sub == "remove" is
+            ui::err("od 0.3 /tools to jeden obraz squashfs budowany przez legendaryos-builder; użyj `lpm tools update`")
+            return 1
+        end
         ui::err("nieznana podkomenda tools: " + sub)
         return 1
     end
