@@ -1,0 +1,109 @@
+mod ui
+mod config
+
+;; lpm solve — pełny solver satsolv względem DZIAŁAJĄCEGO systemu (installed.xml), tylko plan (nic nie jest
+;; pobierane ani zmieniane). Pokazuje, co zostałoby zainstalowane / zaktualizowane / zdegradowane / usunięte
+;; i dlaczego się nie da (problemy solvera).
+;;
+;;   lpm solve <spec>...                          zainstaluj
+;;   lpm solve --erase <spec> [--opt cleandeps]   usuń (z osieroconymi zależnościami)
+;;   lpm solve --update <spec>                    zaktualizuj wskazane
+;;   lpm solve --update-all | --dist-upgrade      aktualizacja całego systemu
+;;   lpm solve --verify                           sprawdź spójność zainstalowanych pakietów
+;;
+;; spec = nazwa | nazwa>=1.2 | nazwa=1.2-3 | glob* | provides:/usr/bin/x
+;; opcje (--opt): best no-weak cleandeps allow-downgrade allow-vendorchange allow-archchange allow-uninstall
+;;                keep-orphans focus-installed strict-priority install-also-updates lock=N favor=N disfavor=N multiversion=N
+
+fn fmt_size(n: int) -> string is
+    if n >= 1048576 is return rp::txn::istr(n / 1048576) + " MiB" end
+    if n >= 1024 is return rp::txn::istr(n / 1024) + " KiB" end
+    return rp::txn::istr(n) + " B"
+end
+
+pub fn run(c: config::Config, rest: [string]) -> int is
+    let mut want: [string] = []
+    let mut erase: [string] = []
+    let mut update: [string] = []
+    let mut opts: [string] = []
+    let mut mode: string = ""
+    let mut i: int = 0
+    while i < rest.len() is
+        let a: string = rest[i]
+        i += 1
+        let mut taken: bool = false
+        if a == "--dist-upgrade" is
+            mode = "dist-upgrade"
+            taken = true
+        end
+        if a == "--update-all" is
+            mode = "update-all"
+            taken = true
+        end
+        if a == "--verify" is
+            mode = "verify"
+            taken = true
+        end
+        if !taken && (a == "--erase" || a == "--update" || a == "--opt") is
+            if i >= rest.len() is
+                ui::err(a + " wymaga wartości")
+                return 1
+            end
+            let v: string = rest[i]
+            i += 1
+            taken = true
+            if a == "--erase" is erase.push(v) end
+            if a == "--update" is update.push(v) end
+            if a == "--opt" is opts.push(v) end
+        end
+        if !taken is want.push(a) end
+    end
+    if want.len() == 0 && erase.len() == 0 && update.len() == 0 && mode == "" is
+        ui::err("lpm solve <spec>... | --erase <spec> | --update <spec> | --update-all | --dist-upgrade | --verify  [--opt <opcja>]")
+        return 1
+    end
+    let ck: string = rp::txn::check_request(want, erase, update, opts)
+    if ck != "" is
+        ui::err(ck)
+        return 1
+    end
+    ui::head("solve")
+    let rows: [string] = rp::txn::flat_solve(config::cache(c), c.repos_file, c.policy_file, c.releasever, c.arch,
+        config::installed_xml(c), want, erase, update, mode, opts, false)
+    let t: string = rp::pure::tab()
+    let mut code: int = 0
+    let mut n_inst: int = 0
+    let mut n_up: int = 0
+    let mut n_er: int = 0
+    let mut n_other: int = 0
+    let mut dl: int = 0
+    let mut r: int = 0
+    while r < rows.len() is
+        let f: [string] = rp::pure::split(rows[r], t)
+        r += 1
+        if f[0] == "E" && f.len() > 1 is
+            ui::err(f[1])
+            code = 1
+        end
+        if f[0] == "P" && f.len() > 1 is ui::warn("problem: " + f[1]) end
+        if f[0] == "W" && f.len() > 1 is ui::warn(f[1]) end
+        if f[0] == "A" && f.len() >= 3 is
+            let kind: string = f[1]
+            if kind == "install" || kind == "multiinstall" is n_inst += 1 else is
+                if kind == "erase" is n_er += 1 else is
+                    if kind == "upgrade" is n_up += 1 else is n_other += 1 end
+                end
+            end
+            write("  " + kind + " " + f[2])
+        end
+        if f[0] == "S" && f.len() >= 9 is dl += rp::pure::parse_uint(f[8]) end
+    end
+    if code != 0 is return code end
+    let total: int = n_inst + n_up + n_er + n_other
+    if total == 0 is
+        ui::ok("nic do zrobienia — system spełnia żądanie")
+        return 0
+    end
+    ui::ok("plan: +" + rp::txn::istr(n_inst) + " nowych, " + rp::txn::istr(n_up) + " aktualizacji, " + rp::txn::istr(n_other) + " innych zmian, -" + rp::txn::istr(n_er) + " usuniętych; do pobrania " + fmt_size(dl))
+    return 0
+end
