@@ -26,7 +26,7 @@ pub fn read_requested(c: config::Config, tag: string) -> [string] is
 end
 
 fn write_requested(c: config::Config, tag: string, names: [string]) -> bool is
-    return fs::write(requested_file(c, tag), ft::text::join(names, "\n") + "\n")
+    return ft::sys::write_text(requested_file(c, tag), ft::text::join(names, "\n") + "\n")
 end
 
 fn contains(xs: [string], s: string) -> bool is
@@ -176,7 +176,7 @@ pub fn install(c: config::Config, pkgs: [string]) -> int is
             fnames.push(ft::text::basename(t.files[z]))
             z += 1
         end
-        let wl: bool = fs::write(ft::text::path_join(requests_dir(c), pkgs[q] + ".list"), ft::text::join(fnames, "\n") + "\n")
+        let wl: bool = ft::sys::write_text(ft::text::path_join(requests_dir(c), pkgs[q] + ".list"), ft::text::join(fnames, "\n") + "\n")
         let cb: bool = ft::sys::ok("cp -f " + ft::sys::sq(t.blocks) + " " + ft::sys::sq(ft::text::path_join(requests_dir(c), pkgs[q] + ".blocks")))
         q += 1
     end
