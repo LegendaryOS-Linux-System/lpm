@@ -31,7 +31,7 @@ pub fn begin(root: string, op: string) -> string is
         end
         ft::sys::rm_rf(tmp_root(root))
     end
-    if !fs::write(p, ft::text::istr(ft::sys::pid()) + " " + op) is return "nie można zapisać dziennika " + p end
+    if !ft::sys::write_text(p, ft::text::istr(ft::sys::pid()) + " " + op) is return "nie można zapisać dziennika " + p end
     return ""
 end
 
